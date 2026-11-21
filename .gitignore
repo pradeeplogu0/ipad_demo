@@ -1,0 +1,11 @@
+﻿# Flutter / Dart
+app/.dart_tool/
+app/build/
+app/.flutter-plugins-dependencies
+# Firmware build output
+firmware/**/build/
+# Python
+__pycache__/
+*.pyc
+# Outputs
+ipa_output/
