@@ -142,12 +142,17 @@ static void handle(const BleMsg &m) {
 
 void setup() {
     Serial.begin(115200);
+    delay(1200);                              // let USB CDC enumerate so boot logs show
+    Serial.println("[SYS] boot");
     Wire.begin();
     analogReadResolution(12);
     display_init();
+    Serial.println("[SYS] display ok");
     ui_init();
+    Serial.println("[SYS] ui ok");
     if (!route_alloc(g_route)) Serial.println("[SYS] route buffer alloc failed");
     ble_link_init();
+    Serial.println("[SYS] ble ok");
     battery_sample();
     g_ui.route = &g_route;
     g_ui.pos = &g_pos;

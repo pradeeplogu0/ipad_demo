@@ -148,22 +148,19 @@ static void draw_turn(uint8_t turn, uint8_t exit_no, bool near) {
 
 // ── build ─────────────────────────────────────────────────────────────
 static lv_obj_t *make_me_arrow(lv_obj_t *p) {
-    // Position chevron drawn once on a small canvas (heading-up, so it never rotates).
-    static lv_color_t buf[LV_CANVAS_BUF_SIZE_TRUE_COLOR_ALPHA(34, 34)];
-    lv_obj_t *c = lv_canvas_create(p);
-    lv_canvas_set_buffer(c, buf, 34, 34, LV_IMG_CF_TRUE_COLOR_ALPHA);
-    lv_canvas_fill_bg(c, lv_color_hex(0), LV_OPA_TRANSP);
-    lv_draw_rect_dsc_t d;
-    lv_draw_rect_dsc_init(&d);
-    d.bg_color = lv_color_hex(0xFFFFFF);
-    d.bg_opa = LV_OPA_COVER;
-    lv_point_t outer[4] = {{17, 1}, {32, 32}, {17, 24}, {2, 32}};
-    lv_canvas_draw_polygon(c, outer, 4, &d);
-    d.bg_color = lv_color_hex(COL_ROUTE);
-    lv_point_t inner[4] = {{17, 7}, {28, 29}, {17, 22}, {6, 29}};
-    lv_canvas_draw_polygon(c, inner, 4, &d);
-    lv_obj_set_pos(c, ARROW_X - 17, ARROW_Y - 17);
-    return c;
+    // Position chevron (heading-up, so it never rotates): a white outline with a
+    // blue core, both drawn as thick rounded polylines.
+    static lv_point_t outline[5] = {
+        {ARROW_X, ARROW_Y - 16}, {ARROW_X + 13, ARROW_Y + 14}, {ARROW_X, ARROW_Y + 6},
+        {ARROW_X - 13, ARROW_Y + 14}, {ARROW_X, ARROW_Y - 16}};
+    static lv_point_t core[5] = {
+        {ARROW_X, ARROW_Y - 9}, {ARROW_X + 7, ARROW_Y + 7}, {ARROW_X, ARROW_Y + 2},
+        {ARROW_X - 7, ARROW_Y + 7}, {ARROW_X, ARROW_Y - 9}};
+    lv_obj_t *o = line(p, 7, 0xFFFFFF);
+    lv_line_set_points(o, outline, 5);
+    lv_obj_t *c = line(p, 6, COL_ROUTE);
+    lv_line_set_points(c, core, 5);
+    return o;
 }
 
 void ui_init() {
