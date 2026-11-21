@@ -1,0 +1,50 @@
+name: Firmware build (NavDisplay)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/firmware-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build-firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 Arduino core 3.3.10
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+
+      - name: Install libraries (LVGL 8.3, TFT_eSPI)
+        run: arduino-cli lib install "lvgl@8.3.11" "TFT_eSPI@2.5.43"
+
+      - name: Configure the display libraries (same as the dev PC)
+        run: |
+          LIBS="$(arduino-cli config get directories.user)/libraries"
+          cp firmware/ci/TFT_eSPI_User_Setup.h "$LIBS/TFT_eSPI/User_Setup.h"
+          cp firmware/ci/lv_conf.h "$LIBS/lv_conf.h"
+
+      - name: Compile NavDisplay
+        run: >
+          arduino-cli compile
+          -b "esp32:esp32:XIAO_ESP32S3:PSRAM=opi,PartitionScheme=default_8MB"
+          --output-dir build/firmware
+          firmware/NavDisplay
+
+      - name: Upload firmware binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: navdisplay-firmware
+          path: build/firmware/*.bin

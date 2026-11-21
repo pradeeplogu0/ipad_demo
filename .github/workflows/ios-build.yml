@@ -1,0 +1,55 @@
+name: iOS build (NavLink unsigned IPA)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/ios-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show Flutter version
+        run: flutter --version
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Analyze and test
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Build iOS app (no code signing)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package as unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry NavLink-unsigned.ipa Payload
+          ls -lh NavLink-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: navlink-ipa
+          path: app/NavLink-unsigned.ipa
+          if-no-files-found: error
