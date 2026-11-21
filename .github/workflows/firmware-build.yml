@@ -2,7 +2,7 @@ name: Firmware build (NavDisplay)
 
 on:
   push:
-    branches: [main]
+    branches: [navlink]
     paths:
       - 'firmware/**'
       - '.github/workflows/firmware-build.yml'

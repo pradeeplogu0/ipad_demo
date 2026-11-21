@@ -1,4 +1,4 @@
-﻿# NavLink
+# NavLink
 
 Turn-by-turn navigation on an iPhone/iPad that streams live directions over Bluetooth LE to
 an ESP32-S3 round display, **NavDisplay**, which draws the route, your position arrow, the next
@@ -63,7 +63,8 @@ python tools/sim_drive.py --selftest      # encoder self-test only
 
 ## 3. Build the iPhone app
 
-Every push that changes `app/**` builds the app on a free macOS runner (public repo):
+This project lives on the **`navlink` branch** of `pradeeplogu0/ipad_demo` (`main` is the Watch Lab app).
+Every push to `navlink` that changes `app/**` builds the app on a free macOS runner (public repo):
 **Actions → "iOS build (NavLink unsigned IPA)"**. When it is green, open the run and download
 the **navlink-ipa** artifact (a .zip containing `NavLink-unsigned.ipa`). You can also start a
 build by hand with **Run workflow**.

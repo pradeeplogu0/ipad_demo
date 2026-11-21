@@ -2,7 +2,7 @@ name: iOS build (NavLink unsigned IPA)
 
 on:
   push:
-    branches: [main]
+    branches: [navlink]
     paths:
       - 'app/**'
       - '.github/workflows/ios-build.yml'
