@@ -7,6 +7,10 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'face_designer.dart';
+import 'face_layout.dart';
+import 'face_painter.dart';
+
 // ---------------------------------------------------------------------------
 // Watch protocol — service 4b0ad7a0-…; see firmware/RoundWatchESP32/ble_service.cpp
 // ---------------------------------------------------------------------------
@@ -24,7 +28,10 @@ final Guid kRot = _u('a9'); // R W N 0-3
 final Guid kBright = _u('aa'); // R W N 5-100
 final Guid kFormat = _u('ab'); // R W N 0 = 24 h, 1 = 12 h
 final Guid kFace = _u('ac'); // R W N 0 = digital, 1 = pendant
-final Guid kSleep = _u('ad'); // R W N seconds, 0 = always on
+final Guid kSleep = _u('ad');
+final Guid kLayout = _u(
+  'ae',
+); // R W N face designer // R W N seconds, 0 = always on
 const String kNamePrefix = 'StepCounter';
 const String kPrefLastWatch = 'last_watch_id';
 
@@ -183,303 +190,6 @@ class ImuPainter extends CustomPainter {
   bool shouldRepaint(ImuPainter old) => false;
 }
 
-// ---------------------------------------------------------------------------
-// Live mirror of the watch face (digital or pendant), drawn at any size.
-// Coordinates follow the 240 x 240 firmware layout.
-// ---------------------------------------------------------------------------
-class WatchFace {
-  const WatchFace({
-    required this.pendant,
-    required this.h12,
-    required this.time,
-    required this.batPct,
-    required this.batMv,
-    required this.rotation,
-    required this.connected,
-    required this.steps,
-    required this.goal,
-    required this.stepMode,
-  });
-  final bool pendant, h12, connected, stepMode;
-  final DateTime? time;
-  final int? batPct, batMv;
-  final int rotation, steps, goal;
-}
-
-class WatchFacePainter extends CustomPainter {
-  WatchFacePainter(this.f);
-  final WatchFace f;
-
-  static const _wd = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
-  static const _mo = [
-    'JAN',
-    'FEB',
-    'MAR',
-    'APR',
-    'MAY',
-    'JUN',
-    'JUL',
-    'AUG',
-    'SEP',
-    'OCT',
-    'NOV',
-    'DEC',
-  ];
-
-  late double _s;
-  late Offset _c;
-
-  void _text(
-    Canvas canvas,
-    String t,
-    double dy,
-    double size,
-    Color color, {
-    FontWeight weight = FontWeight.w500,
-    double dx = 0,
-  }) {
-    final tp = TextPainter(
-      text: TextSpan(
-        text: t,
-        style: TextStyle(
-          color: color,
-          fontSize: size * _s,
-          fontWeight: weight,
-          fontFeatures: const [FontFeature.tabularFigures()],
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(
-      canvas,
-      _c + Offset(dx * _s - tp.width / 2, dy * _s - tp.height / 2),
-    );
-  }
-
-  void _arc(
-    Canvas canvas,
-    double radius,
-    double width,
-    double pct,
-    Color fg,
-    Color track,
-  ) {
-    final rect = Rect.fromCircle(center: _c, radius: radius * _s);
-    const start = 135 * math.pi / 180, sweep = 270 * math.pi / 180;
-    final p = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = width * _s
-      ..strokeCap = StrokeCap.round;
-    canvas.drawArc(rect, start, sweep, false, p..color = track);
-    if (pct > 0) {
-      canvas.drawArc(
-        rect,
-        start,
-        sweep * pct.clamp(0, 1),
-        false,
-        p..color = fg,
-      );
-    }
-  }
-
-  String _hm(DateTime t) {
-    final m = t.minute.toString().padLeft(2, '0');
-    if (!f.h12) return '${t.hour.toString().padLeft(2, '0')}:$m';
-    final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
-    return '$h:$m';
-  }
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    _s = size.shortestSide / 240;
-    _c = size.center(Offset.zero);
-    canvas.drawCircle(_c, 120 * _s, Paint()..color = Colors.black);
-
-    final t = f.time;
-    final batCol = C.battery(f.batPct);
-    final bleCol = f.connected ? const Color(0xFF2ED3A0) : C.muted;
-    final ampm = t == null ? '' : (t.hour < 12 ? 'AM' : 'PM');
-
-    if (f.pendant) {
-      _arc(
-        canvas,
-        116,
-        4,
-        (f.batPct ?? 0) / 100,
-        batCol,
-        const Color(0xFF10161E),
-      );
-      for (var i = 0; i < 12; i++) {
-        final major = i % 3 == 0;
-        final a = i * 30 * math.pi / 180;
-        final r0 = (major ? 92 : 102) * _s, r1 = 110 * _s;
-        final dir = Offset(math.sin(a), -math.cos(a));
-        canvas.drawLine(
-          _c + dir * r0,
-          _c + dir * r1,
-          Paint()
-            ..color = major ? C.gold : const Color(0xFF3A4656)
-            ..strokeWidth = (major ? 4 : 2) * _s
-            ..strokeCap = StrokeCap.round,
-        );
-      }
-      if (f.batPct != null) _text(canvas, '${f.batPct}%', -46, 14, batCol);
-      _text(
-        canvas,
-        t == null
-            ? 'sync time'
-            : '${_wd[t.weekday % 7]} ${t.day}${f.h12 ? '  $ampm' : ''}',
-        46,
-        14,
-        C.gold,
-      );
-      _text(canvas, f.connected ? 'ᛒ ON' : 'ᛒ', 70, 13, bleCol);
-      if (t != null) {
-        void hand(double deg, double len, double tail, double w, Color col) {
-          final a = deg * math.pi / 180;
-          final dir = Offset(math.sin(a), -math.cos(a));
-          canvas.drawLine(
-            _c - dir * tail * _s,
-            _c + dir * len * _s,
-            Paint()
-              ..color = col
-              ..strokeWidth = w * _s
-              ..strokeCap = StrokeCap.round,
-          );
-        }
-
-        final sec = t.second.toDouble(), min = t.minute + sec / 60;
-        hand(((t.hour % 12) + min / 60) * 30, 54, 10, 7, C.text);
-        hand(min * 6, 82, 12, 5, C.text);
-        hand(sec * 6, 94, 18, 2, C.gold);
-      }
-      canvas.drawCircle(_c, 6 * _s, Paint()..color = C.gold);
-      return;
-    }
-
-    // Digital face
-    if (f.stepMode) {
-      _arc(
-        canvas,
-        103,
-        14,
-        f.goal > 0 ? f.steps / f.goal : 0,
-        const Color(0xFF2ED3A0),
-        const Color(0xFF18222E),
-      );
-      _text(
-        canvas,
-        t == null ? '--:--' : '${_hm(t)}${f.h12 ? ' $ampm' : ''}',
-        -76,
-        16,
-        const Color(0xFFC0D0E0),
-      );
-      _text(
-        canvas,
-        '${f.steps}',
-        -4,
-        46,
-        Colors.white,
-        weight: FontWeight.w700,
-      );
-      _text(canvas, '/ ${f.goal}', 32, 16, C.muted);
-    } else {
-      _arc(
-        canvas,
-        103,
-        14,
-        (f.batPct ?? 0) / 100,
-        batCol,
-        const Color(0xFF18222E),
-      );
-      if (t != null) {
-        _text(
-          canvas,
-          '${_wd[t.weekday % 7]} ${t.day} ${_mo[t.month - 1]}',
-          -76,
-          16,
-          const Color(0xFFC0D0E0),
-        );
-      }
-      _text(
-        canvas,
-        t == null ? '--:--' : _hm(t),
-        -4,
-        46,
-        Colors.white,
-        weight: FontWeight.w700,
-      );
-      _text(
-        canvas,
-        t == null
-            ? 'sync time'
-            : (f.h12
-                  ? '$ampm  ${t.second.toString().padLeft(2, '0')}'
-                  : t.second.toString().padLeft(2, '0')),
-        32,
-        16,
-        f.h12 ? C.gold : C.muted,
-      );
-      if (f.batPct != null) {
-        _text(canvas, '${f.batPct}%', 56, 14, batCol, dx: -36);
-        if (f.batMv != null) {
-          _text(
-            canvas,
-            '${(f.batMv! / 1000).toStringAsFixed(2)} V',
-            56,
-            14,
-            const Color(0xFFFF8C5A),
-            dx: 36,
-          );
-        }
-      }
-    }
-    _text(canvas, '⟳ ${f.rotation * 90}°', 76, 14, C.warn);
-    _text(canvas, f.connected ? 'ᛒ ON' : 'ᛒ', 98, 13, bleCol);
-  }
-
-  @override
-  bool shouldRepaint(WatchFacePainter old) => true;
-}
-
-class WatchPreview extends StatelessWidget {
-  const WatchPreview({super.key, required this.face, this.size = 220});
-  final WatchFace face;
-  final double size;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: size,
-      height: size,
-      padding: EdgeInsets.all(size * 0.035),
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: face.pendant
-              ? const [Color(0xFFE9CF7A), Color(0xFF8A6A1E)]
-              : const [Color(0xFF3A4656), Color(0xFF141B24)],
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: (face.pendant ? C.gold : C.accent).withValues(alpha: 0.18),
-            blurRadius: 40,
-            spreadRadius: 2,
-          ),
-        ],
-      ),
-      child: AnimatedRotation(
-        turns: face.rotation / 4,
-        duration: const Duration(milliseconds: 450),
-        curve: Curves.easeInOutCubic,
-        child: CustomPaint(painter: WatchFacePainter(face)),
-      ),
-    );
-  }
-}
-
 // Battery history sparkline
 class SparkPainter extends CustomPainter {
   SparkPainter(this.values, this.color);
@@ -550,7 +260,14 @@ class _WatchLabPageState extends State<WatchLabPage>
 
   BluetoothDevice? _device;
   BluetoothCharacteristic? _steps, _reset, _goal, _time, _sens, _imu;
-  BluetoothCharacteristic? _batt, _clock, _rot, _bright, _format, _face, _sleep;
+  BluetoothCharacteristic? _batt,
+      _clock,
+      _rot,
+      _bright,
+      _format,
+      _face,
+      _sleep,
+      _layoutChr;
   final _subs = <StreamSubscription>[];
   bool _userDisconnect = false;
   String? _savedId;
@@ -572,6 +289,9 @@ class _WatchLabPageState extends State<WatchLabPage>
       _faceVal = 0,
       _sleepVal = 0;
   bool _imuSeen = false;
+  final _layout = FaceLayout();
+  (int, int)? _dragSkip; // element being dragged in the designer
+  Future<void> _writeQueue = Future.value();
 
   bool get _on => _link == Link.on;
   bool get _hasScreen => _on && _rot != null;
@@ -830,6 +550,7 @@ class _WatchLabPageState extends State<WatchLabPage>
     _format = opt(kFormat);
     _face = opt(kFace);
     _sleep = opt(kSleep);
+    _layoutChr = opt(kLayout);
     _imuSeen = false;
     _batHist.clear();
 
@@ -856,6 +577,10 @@ class _WatchLabPageState extends State<WatchLabPage>
     await listen(_format, (v) => _set(() => _formatVal = b0(v, 0, 1, 0)));
     await listen(_face, (v) => _set(() => _faceVal = b0(v, 0, 1, 0)));
     await listen(_sleep, (v) => _set(() => _sleepVal = b0(v, 0, 255, 0)));
+    await listen(
+      _layoutChr,
+      (v) => _set(() => _layout.apply(v, skip: _dragSkip)),
+    );
 
     final goal = await _goal!.read();
     final sens = await _sens!.read();
@@ -921,7 +646,8 @@ class _WatchLabPageState extends State<WatchLabPage>
   void _onOff(String note) {
     _cancelSubs();
     _steps = _reset = _goal = _time = _sens = _imu = null;
-    _batt = _clock = _rot = _bright = _format = _face = _sleep = null;
+    _batt = _clock = _rot = _bright = _format = _face = _sleep = _layoutChr =
+        null;
     _setStatus(Link.off, 'Disconnected', note);
   }
 
@@ -997,8 +723,9 @@ class _WatchLabPageState extends State<WatchLabPage>
   });
 
   // ---------------- UI ----------------
-  WatchFace get _faceModel => WatchFace(
-    pendant: _faceVal == 1,
+  WatchFace _faceFor(int face) => WatchFace(
+    face: face,
+    elements: _layout.faces[face],
     h12: _formatVal == 1,
     time: _clockNow,
     batPct: _batPct,
@@ -1006,9 +733,47 @@ class _WatchLabPageState extends State<WatchLabPage>
     rotation: _rotVal,
     connected: _on,
     steps: _stepsVal,
-    goal: _goalVal,
-    stepMode: _imuSeen,
   );
+
+  WatchFace get _faceModel => _faceFor(_faceVal);
+
+  // ---------------- face designer ----------------
+  bool get _canDesign => _on && _layoutChr != null;
+
+  Future<void> _queueWrite(List<int> bytes) {
+    final c = _layoutChr;
+    if (c == null) return Future.value();
+    return _writeQueue = _writeQueue
+        .then((_) => _write(c, bytes))
+        .catchError((Object e) => _set(() => _note = _err(e)));
+  }
+
+  Future<void> _openDesigner() async {
+    if (!_canDesign) {
+      _toast('Connect to your watch to customise its face');
+      return;
+    }
+    HapticFeedback.selectionClick();
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => FaceDesignerPage(
+          layout: _layout,
+          initialFace: _faceVal,
+          faceFor: _faceFor,
+          onEdit: (e) => _queueWrite(e.encode()),
+          onReset: () => _queueWrite([0xFF]),
+          onShowFace: (f) async {
+            if (_faceVal != f && _face != null) {
+              _set(() => _faceVal = f);
+              await _write(_face!, [f]);
+            }
+          },
+          onDragging: (el) => _dragSkip = el,
+        ),
+      ),
+    );
+    _set(() {});
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1253,7 +1018,11 @@ class _WatchLabPageState extends State<WatchLabPage>
       builder: (_, b) {
         final size = math.min(260.0, b.maxWidth);
         return Center(
-          child: WatchPreview(face: _faceModel, size: size),
+          child: WatchPreview(
+            face: _faceModel,
+            size: size,
+            onTap: _canDesign ? _openDesigner : null,
+          ),
         );
       },
     );
@@ -1626,6 +1395,13 @@ class _WatchLabPageState extends State<WatchLabPage>
     return _card(
       children: [
         _label('Display', icon: Icons.tune_rounded),
+        _btn(
+          'Customize face',
+          primary: true,
+          icon: Icons.brush_rounded,
+          onPressed: _canDesign ? _openDesigner : null,
+        ),
+        const SizedBox(height: 14),
         const Text(
           'Watch face',
           style: TextStyle(color: C.muted, fontSize: 13),
