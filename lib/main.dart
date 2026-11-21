@@ -5,26 +5,31 @@ import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 // ---------------------------------------------------------------------------
-// Watch protocol (same UUIDs and byte layouts as the Watch Lab web page).
+// Watch protocol — service 4b0ad7a0-…; see firmware/RoundWatchESP32/ble_service.cpp
 // ---------------------------------------------------------------------------
-final Guid kService = Guid('4b0ad7a0-4b2c-11ee-be56-0242ac120002');
-final Guid kSteps = Guid('4b0ad7a1-4b2c-11ee-be56-0242ac120002');
-final Guid kReset = Guid('4b0ad7a2-4b2c-11ee-be56-0242ac120002');
-final Guid kGoal = Guid('4b0ad7a3-4b2c-11ee-be56-0242ac120002');
-final Guid kTime = Guid('4b0ad7a4-4b2c-11ee-be56-0242ac120002');
-final Guid kSens = Guid('4b0ad7a5-4b2c-11ee-be56-0242ac120002');
-final Guid kImu = Guid('4b0ad7a6-4b2c-11ee-be56-0242ac120002');
-// Added by the ESP32-S3 Round Display firmware (optional on older watches).
-final Guid kBatt = Guid('4b0ad7a7-4b2c-11ee-be56-0242ac120002');
-final Guid kClock = Guid('4b0ad7a8-4b2c-11ee-be56-0242ac120002');
-final Guid kRot = Guid('4b0ad7a9-4b2c-11ee-be56-0242ac120002');
-final Guid kBright = Guid('4b0ad7aa-4b2c-11ee-be56-0242ac120002');
+Guid _u(String c) => Guid('4b0ad7$c-4b2c-11ee-be56-0242ac120002');
+final Guid kService = _u('a0');
+final Guid kSteps = _u('a1'); // R N  u32
+final Guid kReset = _u('a2'); // W    0x01
+final Guid kGoal = _u('a3'); // R W  u32
+final Guid kTime = _u('a4'); // W    7 bytes
+final Guid kSens = _u('a5'); // R W  u8 1-10
+final Guid kImu = _u('a6'); // R N  4x i16
+final Guid kBatt = _u('a7'); // R N  [pct, 0, mv u16]
+final Guid kClock = _u('a8'); // R N  [yr-1900, mon0, d, h, m, s, wday, valid]
+final Guid kRot = _u('a9'); // R W N 0-3
+final Guid kBright = _u('aa'); // R W N 5-100
+final Guid kFormat = _u('ab'); // R W N 0 = 24 h, 1 = 12 h
+final Guid kFace = _u('ac'); // R W N 0 = digital, 1 = pendant
+final Guid kSleep = _u('ad'); // R W N seconds, 0 = always on
 const String kNamePrefix = 'StepCounter';
+const String kPrefLastWatch = 'last_watch_id';
 
 // ---------------------------------------------------------------------------
-// Palette (mirrors the CSS variables).
+// Palette
 // ---------------------------------------------------------------------------
 class C {
   static const bg = Color(0xFF0B0F14);
@@ -36,6 +41,7 @@ class C {
   static const text = Color(0xFFE8EEF6);
   static const muted = Color(0xFF8B98A8);
   static const accent = Color(0xFF3D8BFD);
+  static const gold = Color(0xFFD4AF37);
   static const ok = Color(0xFF3DD68C);
   static const warn = Color(0xFFF5C542);
   static const bad = Color(0xFFFF6B6B);
@@ -46,6 +52,9 @@ class C {
   static const ay = Color(0xFF51CF66);
   static const az = Color(0xFF4DABF7);
   static const mag = Color(0xFFF5C542);
+
+  static Color battery(int? pct) =>
+      pct == null ? muted : (pct > 30 ? ok : (pct > 15 ? warn : bad));
 }
 
 void main() => runApp(const WatchLabApp());
@@ -73,6 +82,25 @@ class WatchLabApp extends StatelessWidget {
           thumbColor: C.accent,
           inactiveTrackColor: C.grid,
         ),
+        segmentedButtonTheme: SegmentedButtonThemeData(
+          style: ButtonStyle(
+            side: const WidgetStatePropertyAll(BorderSide(color: C.line)),
+            backgroundColor: WidgetStateProperty.resolveWith(
+              (s) => s.contains(WidgetState.selected) ? C.accent : C.btn,
+            ),
+            foregroundColor: WidgetStateProperty.resolveWith(
+              (s) => s.contains(WidgetState.disabled)
+                  ? C.muted.withValues(alpha: 0.5)
+                  : (s.contains(WidgetState.selected) ? Colors.white : C.text),
+            ),
+            textStyle: const WidgetStatePropertyAll(
+              TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+            ),
+            shape: WidgetStatePropertyAll(
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
       ),
       home: const WatchLabPage(),
     );
@@ -80,8 +108,7 @@ class WatchLabApp extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// IMU plot model: smooths raw samples and keeps a rolling history.
-// Used as the CustomPainter's repaint listenable so only the chart redraws.
+// IMU plot model (only shown when the watch has a motion sensor)
 // ---------------------------------------------------------------------------
 class ImuModel extends ChangeNotifier {
   static const maxN = 90;
@@ -125,74 +152,382 @@ class ImuPainter extends CustomPainter {
       ..color = C.grid
       ..strokeWidth = 1;
     for (var i = 1; i < 4; i++) {
-      final y = h * i / 4;
-      canvas.drawLine(Offset(0, y), Offset(w, y), grid);
+      canvas.drawLine(Offset(0, h * i / 4), Offset(w, h * i / 4), grid);
     }
-
-    void line(List<double> arr, Color color, double scale) {
-      final n = arr.length;
-      if (n < 2) return;
+    void line(List<double> arr, Color color) {
+      if (arr.length < 2) return;
       double x(int i) => i / (ImuModel.maxN - 1) * w;
-      double y(double v) => h / 2 - (v / scale) * h * 0.42;
+      double y(double v) => h / 2 - (v / 2500) * h * 0.42;
       final path = Path()..moveTo(x(0), y(arr[0]));
-      for (var i = 1; i < n; i++) {
+      for (var i = 1; i < arr.length; i++) {
         final x0 = x(i - 1), y0 = y(arr[i - 1]);
-        final x1 = x(i), y1 = y(arr[i]);
-        path.quadraticBezierTo(x0, y0, (x0 + x1) / 2, (y0 + y1) / 2);
+        path.quadraticBezierTo(x0, y0, (x0 + x(i)) / 2, (y0 + y(arr[i])) / 2);
       }
-      path.lineTo(x(n - 1), y(arr[n - 1]));
       canvas.drawPath(
         path,
         Paint()
           ..color = color
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2
-          ..strokeJoin = StrokeJoin.round
           ..strokeCap = StrokeCap.round,
       );
     }
 
-    if (m.visible['x']!) line(m.hist['x']!, C.ax, 2500);
-    if (m.visible['y']!) line(m.hist['y']!, C.ay, 2500);
-    if (m.visible['z']!) line(m.hist['z']!, C.az, 2500);
-    if (m.visible['mag']!) line(m.hist['mag']!, C.mag, 2500);
+    if (m.visible['x']!) line(m.hist['x']!, C.ax);
+    if (m.visible['y']!) line(m.hist['y']!, C.ay);
+    if (m.visible['z']!) line(m.hist['z']!, C.az);
+    if (m.visible['mag']!) line(m.hist['mag']!, C.mag);
   }
 
   @override
   bool shouldRepaint(ImuPainter old) => false;
 }
 
-class RingPainter extends CustomPainter {
-  RingPainter(this.pct, {this.color = C.accent});
-  final double pct;
+// ---------------------------------------------------------------------------
+// Live mirror of the watch face (digital or pendant), drawn at any size.
+// Coordinates follow the 240 x 240 firmware layout.
+// ---------------------------------------------------------------------------
+class WatchFace {
+  const WatchFace({
+    required this.pendant,
+    required this.h12,
+    required this.time,
+    required this.batPct,
+    required this.batMv,
+    required this.rotation,
+    required this.connected,
+    required this.steps,
+    required this.goal,
+    required this.stepMode,
+  });
+  final bool pendant, h12, connected, stepMode;
+  final DateTime? time;
+  final int? batPct, batMv;
+  final int rotation, steps, goal;
+}
+
+class WatchFacePainter extends CustomPainter {
+  WatchFacePainter(this.f);
+  final WatchFace f;
+
+  static const _wd = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+  static const _mo = [
+    'JAN',
+    'FEB',
+    'MAR',
+    'APR',
+    'MAY',
+    'JUN',
+    'JUL',
+    'AUG',
+    'SEP',
+    'OCT',
+    'NOV',
+    'DEC',
+  ];
+
+  late double _s;
+  late Offset _c;
+
+  void _text(
+    Canvas canvas,
+    String t,
+    double dy,
+    double size,
+    Color color, {
+    FontWeight weight = FontWeight.w500,
+    double dx = 0,
+  }) {
+    final tp = TextPainter(
+      text: TextSpan(
+        text: t,
+        style: TextStyle(
+          color: color,
+          fontSize: size * _s,
+          fontWeight: weight,
+          fontFeatures: const [FontFeature.tabularFigures()],
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(
+      canvas,
+      _c + Offset(dx * _s - tp.width / 2, dy * _s - tp.height / 2),
+    );
+  }
+
+  void _arc(
+    Canvas canvas,
+    double radius,
+    double width,
+    double pct,
+    Color fg,
+    Color track,
+  ) {
+    final rect = Rect.fromCircle(center: _c, radius: radius * _s);
+    const start = 135 * math.pi / 180, sweep = 270 * math.pi / 180;
+    final p = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = width * _s
+      ..strokeCap = StrokeCap.round;
+    canvas.drawArc(rect, start, sweep, false, p..color = track);
+    if (pct > 0) {
+      canvas.drawArc(
+        rect,
+        start,
+        sweep * pct.clamp(0, 1),
+        false,
+        p..color = fg,
+      );
+    }
+  }
+
+  String _hm(DateTime t) {
+    final m = t.minute.toString().padLeft(2, '0');
+    if (!f.h12) return '${t.hour.toString().padLeft(2, '0')}:$m';
+    final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
+    return '$h:$m';
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _s = size.shortestSide / 240;
+    _c = size.center(Offset.zero);
+    canvas.drawCircle(_c, 120 * _s, Paint()..color = Colors.black);
+
+    final t = f.time;
+    final batCol = C.battery(f.batPct);
+    final bleCol = f.connected ? const Color(0xFF2ED3A0) : C.muted;
+    final ampm = t == null ? '' : (t.hour < 12 ? 'AM' : 'PM');
+
+    if (f.pendant) {
+      _arc(
+        canvas,
+        116,
+        4,
+        (f.batPct ?? 0) / 100,
+        batCol,
+        const Color(0xFF10161E),
+      );
+      for (var i = 0; i < 12; i++) {
+        final major = i % 3 == 0;
+        final a = i * 30 * math.pi / 180;
+        final r0 = (major ? 92 : 102) * _s, r1 = 110 * _s;
+        final dir = Offset(math.sin(a), -math.cos(a));
+        canvas.drawLine(
+          _c + dir * r0,
+          _c + dir * r1,
+          Paint()
+            ..color = major ? C.gold : const Color(0xFF3A4656)
+            ..strokeWidth = (major ? 4 : 2) * _s
+            ..strokeCap = StrokeCap.round,
+        );
+      }
+      if (f.batPct != null) _text(canvas, '${f.batPct}%', -46, 14, batCol);
+      _text(
+        canvas,
+        t == null
+            ? 'sync time'
+            : '${_wd[t.weekday % 7]} ${t.day}${f.h12 ? '  $ampm' : ''}',
+        46,
+        14,
+        C.gold,
+      );
+      _text(canvas, f.connected ? 'ᛒ ON' : 'ᛒ', 70, 13, bleCol);
+      if (t != null) {
+        void hand(double deg, double len, double tail, double w, Color col) {
+          final a = deg * math.pi / 180;
+          final dir = Offset(math.sin(a), -math.cos(a));
+          canvas.drawLine(
+            _c - dir * tail * _s,
+            _c + dir * len * _s,
+            Paint()
+              ..color = col
+              ..strokeWidth = w * _s
+              ..strokeCap = StrokeCap.round,
+          );
+        }
+
+        final sec = t.second.toDouble(), min = t.minute + sec / 60;
+        hand(((t.hour % 12) + min / 60) * 30, 54, 10, 7, C.text);
+        hand(min * 6, 82, 12, 5, C.text);
+        hand(sec * 6, 94, 18, 2, C.gold);
+      }
+      canvas.drawCircle(_c, 6 * _s, Paint()..color = C.gold);
+      return;
+    }
+
+    // Digital face
+    if (f.stepMode) {
+      _arc(
+        canvas,
+        103,
+        14,
+        f.goal > 0 ? f.steps / f.goal : 0,
+        const Color(0xFF2ED3A0),
+        const Color(0xFF18222E),
+      );
+      _text(
+        canvas,
+        t == null ? '--:--' : '${_hm(t)}${f.h12 ? ' $ampm' : ''}',
+        -76,
+        16,
+        const Color(0xFFC0D0E0),
+      );
+      _text(
+        canvas,
+        '${f.steps}',
+        -4,
+        46,
+        Colors.white,
+        weight: FontWeight.w700,
+      );
+      _text(canvas, '/ ${f.goal}', 32, 16, C.muted);
+    } else {
+      _arc(
+        canvas,
+        103,
+        14,
+        (f.batPct ?? 0) / 100,
+        batCol,
+        const Color(0xFF18222E),
+      );
+      if (t != null) {
+        _text(
+          canvas,
+          '${_wd[t.weekday % 7]} ${t.day} ${_mo[t.month - 1]}',
+          -76,
+          16,
+          const Color(0xFFC0D0E0),
+        );
+      }
+      _text(
+        canvas,
+        t == null ? '--:--' : _hm(t),
+        -4,
+        46,
+        Colors.white,
+        weight: FontWeight.w700,
+      );
+      _text(
+        canvas,
+        t == null
+            ? 'sync time'
+            : (f.h12
+                  ? '$ampm  ${t.second.toString().padLeft(2, '0')}'
+                  : t.second.toString().padLeft(2, '0')),
+        32,
+        16,
+        f.h12 ? C.gold : C.muted,
+      );
+      if (f.batPct != null) {
+        _text(canvas, '${f.batPct}%', 56, 14, batCol, dx: -36);
+        if (f.batMv != null) {
+          _text(
+            canvas,
+            '${(f.batMv! / 1000).toStringAsFixed(2)} V',
+            56,
+            14,
+            const Color(0xFFFF8C5A),
+            dx: 36,
+          );
+        }
+      }
+    }
+    _text(canvas, '⟳ ${f.rotation * 90}°', 76, 14, C.warn);
+    _text(canvas, f.connected ? 'ᛒ ON' : 'ᛒ', 98, 13, bleCol);
+  }
+
+  @override
+  bool shouldRepaint(WatchFacePainter old) => true;
+}
+
+class WatchPreview extends StatelessWidget {
+  const WatchPreview({super.key, required this.face, this.size = 220});
+  final WatchFace face;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      padding: EdgeInsets.all(size * 0.035),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: face.pendant
+              ? const [Color(0xFFE9CF7A), Color(0xFF8A6A1E)]
+              : const [Color(0xFF3A4656), Color(0xFF141B24)],
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: (face.pendant ? C.gold : C.accent).withValues(alpha: 0.18),
+            blurRadius: 40,
+            spreadRadius: 2,
+          ),
+        ],
+      ),
+      child: AnimatedRotation(
+        turns: face.rotation / 4,
+        duration: const Duration(milliseconds: 450),
+        curve: Curves.easeInOutCubic,
+        child: CustomPaint(painter: WatchFacePainter(face)),
+      ),
+    );
+  }
+}
+
+// Battery history sparkline
+class SparkPainter extends CustomPainter {
+  SparkPainter(this.values, this.color);
+  final List<double> values;
   final Color color;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final r = size.shortestSide / 2 - 10;
-    final c = size.center(Offset.zero);
-    final bg = Paint()
-      ..color = C.grid
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 12;
-    canvas.drawCircle(c, r, bg);
-    if (pct <= 0) return;
-    final fg = Paint()
-      ..color = color
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 12
-      ..strokeCap = StrokeCap.round;
-    canvas.drawArc(
-      Rect.fromCircle(center: c, radius: r),
-      -math.pi / 2,
-      2 * math.pi * pct,
-      false,
-      fg,
+    if (values.length < 2) return;
+    var lo = values.reduce(math.min), hi = values.reduce(math.max);
+    if (hi - lo < 4) {
+      final mid = (hi + lo) / 2;
+      lo = mid - 2;
+      hi = mid + 2;
+    }
+    Offset pt(int i) => Offset(
+      i / (values.length - 1) * size.width,
+      size.height - (values[i] - lo) / (hi - lo) * size.height,
+    );
+    final path = Path()..moveTo(pt(0).dx, pt(0).dy);
+    for (var i = 1; i < values.length; i++) {
+      path.lineTo(pt(i).dx, pt(i).dy);
+    }
+    final fill = Path.from(path)
+      ..lineTo(size.width, size.height)
+      ..lineTo(0, size.height)
+      ..close();
+    canvas.drawPath(
+      fill,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [color.withValues(alpha: 0.35), color.withValues(alpha: 0)],
+        ).createShader(Offset.zero & size),
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2
+        ..strokeJoin = StrokeJoin.round,
     );
   }
 
   @override
-  bool shouldRepaint(RingPainter old) => old.pct != pct || old.color != color;
+  bool shouldRepaint(SparkPainter old) => true;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,31 +550,38 @@ class _WatchLabPageState extends State<WatchLabPage>
 
   BluetoothDevice? _device;
   BluetoothCharacteristic? _steps, _reset, _goal, _time, _sens, _imu;
-  BluetoothCharacteristic? _batt, _clock, _rot, _bright; // optional
+  BluetoothCharacteristic? _batt, _clock, _rot, _bright, _format, _face, _sleep;
   final _subs = <StreamSubscription>[];
-
-  int? _batPct; // 0-100
-  int? _batMv; // battery millivolts
-  DateTime? _clockNow; // watch RTC time (null = not set / unknown)
-  int _rotVal = 0; // 0-3 (x90 deg)
-  int _brightVal = 100; // %
-  bool _imuSeen = false; // got non-zero IMU data → watch has a motion sensor
+  bool _userDisconnect = false;
+  String? _savedId;
 
   Link _link = Link.off;
   String _statusText = 'Disconnected';
-  String _note = 'Tap Connect to scan for your StepCounter watch.';
-  int _stepsVal = 0;
-  int _goalVal = 8000;
-  int _sensVal = 5;
-  int _sensSent = 5;
-  String _watchTime = '—';
+  String _note = 'Tap Connect to find your watch.';
+  String _deviceName = '';
+
+  int _stepsVal = 0, _goalVal = 8000, _sensVal = 5;
+  int? _batPct, _batMv;
+  final _batHist = <double>[];
+  DateTime? _batAt;
+  DateTime? _clockNow;
+  int? _driftSec; // watch - phone, seconds
+  int _rotVal = 0,
+      _brightVal = 100,
+      _formatVal = 0,
+      _faceVal = 0,
+      _sleepVal = 0;
+  bool _imuSeen = false;
 
   bool get _on => _link == Link.on;
+  bool get _hasScreen => _on && _rot != null;
+  bool get _showSteps => _imuSeen || (_on && _batt == null);
 
   @override
   void initState() {
     super.initState();
     _ticker.start();
+    _loadSaved();
   }
 
   @override
@@ -257,6 +599,7 @@ class _WatchLabPageState extends State<WatchLabPage>
       : 0;
 
   void _toast(String t) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(
@@ -265,7 +608,7 @@ class _WatchLabPageState extends State<WatchLabPage>
           backgroundColor: C.btn,
           behavior: SnackBarBehavior.floating,
           width: 320,
-          duration: const Duration(milliseconds: 2200),
+          duration: const Duration(milliseconds: 1800),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
             side: const BorderSide(color: C.line),
@@ -300,13 +643,48 @@ class _WatchLabPageState extends State<WatchLabPage>
     return e.toString();
   }
 
-  // ---------------- connection ----------------
-  Future<void> _connect() async {
-    if (!await FlutterBluePlus.isSupported) {
-      _setStatus(Link.err, 'Failed', 'Bluetooth LE is not supported here.');
-      return;
+  Future<void> _run(Future<void> Function() f) async {
+    try {
+      await f();
+    } catch (e) {
+      if (mounted) setState(() => _note = _err(e));
     }
-    _setStatus(Link.busy, 'Scanning…', 'Waiting for Bluetooth…');
+  }
+
+  // ---------------- remembered watch ----------------
+  Future<void> _loadSaved() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      _savedId = p.getString(kPrefLastWatch);
+    } catch (_) {}
+    if (_savedId != null && mounted) {
+      setState(() {});
+      _connect(auto: true);
+    }
+  }
+
+  Future<void> _saveWatch(String? id) async {
+    _savedId = id;
+    try {
+      final p = await SharedPreferences.getInstance();
+      if (id == null) {
+        await p.remove(kPrefLastWatch);
+      } else {
+        await p.setString(kPrefLastWatch, id);
+      }
+    } catch (_) {}
+  }
+
+  // ---------------- connection ----------------
+  Future<bool> _bluetoothReady() async {
+    if (!await FlutterBluePlus.isSupported) {
+      _setStatus(
+        Link.err,
+        'No Bluetooth',
+        'Bluetooth LE is not supported here.',
+      );
+      return false;
+    }
     final state = await FlutterBluePlus.adapterState
         .where((s) => s != BluetoothAdapterState.unknown)
         .first
@@ -314,27 +692,69 @@ class _WatchLabPageState extends State<WatchLabPage>
           const Duration(seconds: 5),
           onTimeout: () => BluetoothAdapterState.unknown,
         );
-    if (state != BluetoothAdapterState.on) {
-      _setStatus(
-        Link.err,
-        'Bluetooth off',
-        state == BluetoothAdapterState.unauthorized
-            ? 'Allow Bluetooth for Watch Lab in Settings → Privacy & Security → Bluetooth.'
-            : 'Turn on Bluetooth in Control Centre, then tap Connect again.',
+    if (state == BluetoothAdapterState.on) return true;
+    _setStatus(
+      Link.err,
+      'Bluetooth off',
+      state == BluetoothAdapterState.unauthorized
+          ? 'Allow Bluetooth for Watch Lab in Settings → Privacy & Security → Bluetooth.'
+          : 'Turn on Bluetooth in Control Centre, then tap Connect.',
+    );
+    return false;
+  }
+
+  /// Finds the remembered watch by scanning for its id (works on iOS, where
+  /// ids are per-phone UUIDs, without showing the picker).
+  Future<BluetoothDevice?> _findSaved(String id) async {
+    final done = Completer<BluetoothDevice?>();
+    final sub = FlutterBluePlus.onScanResults.listen((rs) {
+      for (final r in rs) {
+        if (r.device.remoteId.str == id && !done.isCompleted) {
+          done.complete(r.device);
+        }
+      }
+    });
+    try {
+      await FlutterBluePlus.startScan(
+        withRemoteIds: [id],
+        timeout: const Duration(seconds: 10),
+        webOptionalServices: [kService],
       );
-      return;
+      return await done.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => null,
+      );
+    } finally {
+      await sub.cancel();
+      await FlutterBluePlus.stopScan();
     }
+  }
+
+  Future<void> _connect({bool auto = false}) async {
+    if (_link == Link.busy || _on) return;
+    if (!await _bluetoothReady()) return;
+    _userDisconnect = false;
 
     var device = _device;
+    if (device == null && _savedId != null && !FlutterBluePlus.isScanningNow) {
+      _setStatus(Link.busy, 'Searching…', 'Looking for your watch…');
+      try {
+        device = await _findSaved(_savedId!);
+      } catch (_) {}
+      if (device == null && auto) {
+        _setStatus(
+          Link.off,
+          'Disconnected',
+          'Your watch is not in range. Tap Connect when it is nearby.',
+        );
+        return;
+      }
+    }
     if (device == null) {
-      _setStatus(
-        Link.busy,
-        'Scanning…',
-        'Pick your StepCounter from the list.',
-      );
+      _setStatus(Link.busy, 'Scanning…', 'Pick your watch from the list.');
       device = await _pickDevice();
       if (device == null) {
-        _setStatus(Link.off, 'Disconnected', 'No device selected.');
+        _setStatus(Link.off, 'Disconnected', 'No watch selected.');
         return;
       }
     }
@@ -378,18 +798,14 @@ class _WatchLabPageState extends State<WatchLabPage>
 
     _subs.add(
       d.connectionState.listen((s) {
-        if (s == BluetoothConnectionState.disconnected && _on) _onOff();
+        if (s == BluetoothConnectionState.disconnected && _on) _onLost();
       }),
     );
 
     final services = await d.discoverServices();
     final svc = services.firstWhere(
       (s) => s.uuid == kService,
-      orElse: () => throw 'StepCounter service not found on this device.',
-    );
-    BluetoothCharacteristic ch(Guid id) => svc.characteristics.firstWhere(
-      (c) => c.uuid == id,
-      orElse: () => throw 'Characteristic $id missing.',
+      orElse: () => throw 'This device is not a StepCounter watch.',
     );
     BluetoothCharacteristic? opt(Guid id) {
       for (final c in svc.characteristics) {
@@ -398,123 +814,137 @@ class _WatchLabPageState extends State<WatchLabPage>
       return null;
     }
 
-    _steps = ch(kSteps);
-    _reset = ch(kReset);
-    _goal = ch(kGoal);
-    _time = ch(kTime);
-    _sens = ch(kSens);
-    _imu = ch(kImu);
+    BluetoothCharacteristic req(Guid id) =>
+        opt(id) ?? (throw 'Watch is missing characteristic $id.');
+
+    _steps = req(kSteps);
+    _reset = req(kReset);
+    _goal = req(kGoal);
+    _time = req(kTime);
+    _sens = req(kSens);
+    _imu = req(kImu);
     _batt = opt(kBatt);
     _clock = opt(kClock);
     _rot = opt(kRot);
     _bright = opt(kBright);
+    _format = opt(kFormat);
+    _face = opt(kFace);
+    _sleep = opt(kSleep);
     _imuSeen = false;
+    _batHist.clear();
 
-    _subs.add(
-      _steps!.onValueReceived.listen((v) {
-        if (mounted) setState(() => _stepsVal = _u32(v));
-      }),
-    );
-    _subs.add(
-      _imu!.onValueReceived.listen((v) {
-        if (v.length < 8) return;
-        final bd = ByteData.sublistView(Uint8List.fromList(v));
-        imu.raw['x'] = bd.getInt16(0, Endian.little).toDouble();
-        imu.raw['y'] = bd.getInt16(2, Endian.little).toDouble();
-        imu.raw['z'] = bd.getInt16(4, Endian.little).toDouble();
-        imu.raw['mag'] = bd.getInt16(6, Endian.little).toDouble();
-        if (!_imuSeen && v.any((b) => b != 0) && mounted) {
-          setState(() => _imuSeen = true);
-        }
-      }),
-    );
-    await _steps!.setNotifyValue(true);
-    await _imu!.setNotifyValue(true);
-
-    if (_batt != null) {
-      _subs.add(_batt!.onValueReceived.listen(_onBattery));
-      await _batt!.setNotifyValue(true);
-    }
-    if (_clock != null) {
-      _subs.add(_clock!.onValueReceived.listen(_onClock));
-      await _clock!.setNotifyValue(true);
+    Future<void> listen(
+      BluetoothCharacteristic? c,
+      void Function(List<int>) f, {
+      bool read = true,
+    }) async {
+      if (c == null) return;
+      _subs.add(c.onValueReceived.listen(f));
+      if (c.properties.notify) await c.setNotifyValue(true);
+      if (read && c.properties.read) f(await c.read());
     }
 
-    final name = d.platformName.isNotEmpty ? d.platformName : 'XIAO';
-    _setStatus(
-      Link.on,
-      'Connected',
-      'Connected to $name. Time synced automatically.',
-    );
+    int b0(List<int> v, int lo, int hi, int fallback) =>
+        v.isEmpty ? fallback : v[0].clamp(lo, hi);
 
-    final steps = await _steps!.read();
+    await listen(_steps, (v) => _set(() => _stepsVal = _u32(v)));
+    await listen(_imu, _onImu, read: false);
+    await listen(_batt, _onBattery);
+    await listen(_clock, _onClock);
+    await listen(_rot, (v) => _set(() => _rotVal = b0(v, 0, 3, 0)));
+    await listen(_bright, (v) => _set(() => _brightVal = b0(v, 5, 100, 100)));
+    await listen(_format, (v) => _set(() => _formatVal = b0(v, 0, 1, 0)));
+    await listen(_face, (v) => _set(() => _faceVal = b0(v, 0, 1, 0)));
+    await listen(_sleep, (v) => _set(() => _sleepVal = b0(v, 0, 255, 0)));
+
     final goal = await _goal!.read();
     final sens = await _sens!.read();
-    if (!mounted) return;
-    setState(() {
-      _stepsVal = _u32(steps);
+    _deviceName = d.platformName.isNotEmpty ? d.platformName : 'StepCounter';
+    _set(() {
       _goalVal = _u32(goal);
       _goalCtl.text = '$_goalVal';
-      if (sens.isNotEmpty) _sensVal = _sensSent = sens[0].clamp(1, 10);
+      _sensVal = b0(sens, 1, 10, 5);
     });
-    if (_batt != null) _onBattery(await _batt!.read());
-    if (_rot != null) {
-      final r = await _rot!.read();
-      if (r.isNotEmpty && mounted) setState(() => _rotVal = r[0] & 3);
-    }
-    if (_bright != null) {
-      final b = await _bright!.read();
-      if (b.isNotEmpty && mounted) {
-        setState(() => _brightVal = b[0].clamp(5, 100));
-      }
-    }
+
+    await _saveWatch(d.remoteId.str);
+    _setStatus(Link.on, 'Connected', 'Connected to $_deviceName.');
+    HapticFeedback.mediumImpact();
     await _syncTime(auto: true);
   }
 
+  void _set(VoidCallback f) {
+    if (mounted) setState(f);
+  }
+
+  void _onImu(List<int> v) {
+    if (v.length < 8) return;
+    final bd = ByteData.sublistView(Uint8List.fromList(v));
+    imu.raw['x'] = bd.getInt16(0, Endian.little).toDouble();
+    imu.raw['y'] = bd.getInt16(2, Endian.little).toDouble();
+    imu.raw['z'] = bd.getInt16(4, Endian.little).toDouble();
+    imu.raw['mag'] = bd.getInt16(6, Endian.little).toDouble();
+    if (!_imuSeen && v.any((b) => b != 0)) _set(() => _imuSeen = true);
+  }
+
   void _onBattery(List<int> v) {
-    if (v.length < 4 || !mounted) return;
-    setState(() {
+    if (v.length < 4) return;
+    _set(() {
       _batPct = v[0].clamp(0, 100);
       _batMv = v[2] | (v[3] << 8);
+      _batAt = DateTime.now();
+      _batHist.add(_batMv! / 1000);
+      if (_batHist.length > 300) _batHist.removeAt(0); // ~10 min at 2 s
     });
   }
 
   void _onClock(List<int> v) {
-    if (v.length < 8 || !mounted) return;
-    setState(() {
-      _clockNow = v[7] == 1
-          ? DateTime(1900 + v[0], v[1] + 1, v[2], v[3], v[4], v[5])
-          : null;
+    if (v.length < 8) return;
+    _set(() {
+      if (v[7] == 1) {
+        _clockNow = DateTime(1900 + v[0], v[1] + 1, v[2], v[3], v[4], v[5]);
+        _driftSec = _clockNow!.difference(DateTime.now()).inSeconds;
+      } else {
+        _clockNow = null;
+        _driftSec = null;
+      }
     });
   }
 
   Future<void> _disconnect() async {
+    _userDisconnect = true;
     try {
       await _device?.disconnect();
     } catch (_) {}
-    _onOff();
+    _onOff('Disconnected. Tap Connect to reconnect to $_deviceName.');
   }
 
-  void _onOff() {
+  void _onOff(String note) {
     _cancelSubs();
     _steps = _reset = _goal = _time = _sens = _imu = null;
-    _batt = _clock = _rot = _bright = null;
-    _setStatus(
-      Link.off,
-      'Disconnected',
-      'Disconnected. Connect again — it will reuse the last watch if still in range.',
-    );
+    _batt = _clock = _rot = _bright = _format = _face = _sleep = null;
+    _setStatus(Link.off, 'Disconnected', note);
+  }
+
+  /// Unexpected disconnect (out of range, watch reset): try to come back.
+  void _onLost() {
+    _onOff('Connection lost — reconnecting…');
+    if (_userDisconnect) return;
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted && !_on && _link != Link.busy && !_userDisconnect) {
+        _device = null; // re-find by saved id
+        _connect(auto: true);
+      }
+    });
+  }
+
+  Future<void> _forget() async {
+    await _disconnect();
+    _device = null;
+    await _saveWatch(null);
+    _set(() => _note = 'Watch forgotten. Tap Connect to pick a watch.');
   }
 
   // ---------------- actions ----------------
-  Future<void> _run(Future<void> Function() f) async {
-    try {
-      await f();
-    } catch (e) {
-      if (mounted) setState(() => _note = _err(e));
-    }
-  }
-
   Future<void> _syncTime({bool auto = false}) => _run(() async {
     final t = _time;
     if (t == null) return;
@@ -526,59 +956,60 @@ class _WatchLabPageState extends State<WatchLabPage>
       n.hour,
       n.minute,
       n.second,
-      n.weekday % 7, // JS getDay(): Sunday = 0
+      n.weekday % 7, // Sunday = 0
     ]);
-    if (!mounted) return;
-    setState(
-      () => _watchTime =
-          '${n.hour.toString().padLeft(2, '0')}:${n.minute.toString().padLeft(2, '0')}',
-    );
-    if (!auto) _toast('Watch clock set from this phone');
+    if (!auto) {
+      HapticFeedback.selectionClick();
+      _toast('Watch clock set from this phone');
+    }
+  });
+
+  Future<void> _sendByte(
+    BluetoothCharacteristic? c,
+    int v,
+    String msg,
+    VoidCallback local,
+  ) => _run(() async {
+    if (c == null) return;
+    HapticFeedback.selectionClick();
+    _set(local); // optimistic; the watch confirms via notify
+    await _write(c, [v]);
+    if (msg.isNotEmpty) _toast(msg);
   });
 
   Future<void> _sendGoal() => _run(() async {
     final g = int.tryParse(_goalCtl.text);
     if (_goal == null || g == null || g < 1000 || g > 50000) {
-      setState(() => _note = 'Goal must be 1000–50000.');
+      _set(() => _note = 'Goal must be 1000–50000.');
       return;
     }
     final b = ByteData(4)..setUint32(0, g, Endian.little);
     await _write(_goal!, b.buffer.asUint8List());
-    setState(() => _goalVal = g);
+    _set(() => _goalVal = g);
     _toast('Goal $g sent');
-  });
-
-  Future<void> _sendSens(int v) => _run(() async {
-    if (_sens == null) return;
-    await _write(_sens!, [v]);
-    setState(() => _sensSent = v);
-    _toast('Sensitivity $v sent');
   });
 
   Future<void> _resetSteps() => _run(() async {
     if (_reset == null) return;
     await _write(_reset!, [1]);
-    setState(() => _stepsVal = 0);
+    _set(() => _stepsVal = 0);
     _toast('Watch steps reset');
   });
 
-  Future<void> _sendRotation(int r) => _run(() async {
-    if (_rot == null) return;
-    await _write(_rot!, [r & 3]);
-    setState(() => _rotVal = r & 3);
-    _toast('Screen rotated to ${r * 90}°');
-  });
-
-  Future<void> _sendBrightness(int p) => _run(() async {
-    if (_bright == null) return;
-    await _write(_bright!, [p.clamp(5, 100)]);
-    _toast('Brightness $p% sent');
-  });
-
-  static String _sensWord(int v) =>
-      v <= 3 ? 'strict' : (v >= 8 ? 'sensitive' : 'balanced');
-
   // ---------------- UI ----------------
+  WatchFace get _faceModel => WatchFace(
+    pendant: _faceVal == 1,
+    h12: _formatVal == 1,
+    time: _clockNow,
+    batPct: _batPct,
+    batMv: _batMv,
+    rotation: _rotVal,
+    connected: _on,
+    steps: _stepsVal,
+    goal: _goalVal,
+    stepMode: _imuSeen,
+  );
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -595,6 +1026,20 @@ class _WatchLabPageState extends State<WatchLabPage>
           child: LayoutBuilder(
             builder: (context, box) {
               final wide = box.maxWidth >= 900;
+              final left = <Widget>[
+                _heroCard(),
+                const SizedBox(height: 14),
+                _batteryCard(),
+                if (_imuSeen) ...[const SizedBox(height: 14), _imuCard()],
+              ];
+              final right = <Widget>[
+                _connectionCard(),
+                const SizedBox(height: 14),
+                _clockCard(),
+                const SizedBox(height: 14),
+                _displayCard(),
+                if (_showSteps) ...[const SizedBox(height: 14), _stepsCard()],
+              ];
               return SingleChildScrollView(
                 padding: const EdgeInsets.fromLTRB(16, 20, 16, 36),
                 child: Center(
@@ -609,15 +1054,29 @@ class _WatchLabPageState extends State<WatchLabPage>
                           Row(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Expanded(flex: 125, child: _mainCard()),
+                              Expanded(
+                                flex: 11,
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: left,
+                                ),
+                              ),
                               const SizedBox(width: 14),
-                              Expanded(flex: 75, child: _sideCards()),
+                              Expanded(
+                                flex: 9,
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.stretch,
+                                  children: right,
+                                ),
+                              ),
                             ],
                           )
                         else ...[
-                          _mainCard(),
+                          ...left,
                           const SizedBox(height: 14),
-                          _sideCards(),
+                          ...right,
                         ],
                       ],
                     ),
@@ -632,35 +1091,20 @@ class _WatchLabPageState extends State<WatchLabPage>
   }
 
   Widget _header() {
-    final (Color fg, Color bg, Color border, Color dot) = switch (_link) {
-      Link.on => (const Color(0xFF062012), C.ok, C.ok, const Color(0xFF062012)),
-      Link.busy => (
-        C.warn,
-        const Color(0xFF0E141C),
-        C.warn,
-        const Color(0xFF5B6777),
-      ),
-      Link.err => (
-        C.bad,
-        const Color(0xFF0E141C),
-        C.bad,
-        const Color(0xFF5B6777),
-      ),
-      Link.off => (
-        C.muted,
-        const Color(0xFF0E141C),
-        C.line,
-        const Color(0xFF5B6777),
-      ),
+    final (Color fg, Color bg, Color border) = switch (_link) {
+      Link.on => (const Color(0xFF062012), C.ok, C.ok),
+      Link.busy => (C.warn, const Color(0xFF0E141C), C.warn),
+      Link.err => (C.bad, const Color(0xFF0E141C), C.bad),
+      Link.off => (C.muted, const Color(0xFF0E141C), C.line),
     };
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Expanded(
+        Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
+              const Text(
                 'Watch Lab',
                 style: TextStyle(
                   fontSize: 26,
@@ -669,10 +1113,12 @@ class _WatchLabPageState extends State<WatchLabPage>
                   color: C.text,
                 ),
               ),
-              SizedBox(height: 4),
+              const SizedBox(height: 4),
               Text(
-                'XIAO nRF54LM20A · goal, clock, sensitivity, live IMU',
-                style: TextStyle(fontSize: 13, color: C.muted),
+                _on
+                    ? '$_deviceName · XIAO ESP32-S3 Round Display'
+                    : 'Pendant & watch companion',
+                style: const TextStyle(fontSize: 13, color: C.muted),
               ),
             ],
           ),
@@ -688,18 +1134,28 @@ class _WatchLabPageState extends State<WatchLabPage>
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
-              ),
-              const SizedBox(width: 8),
+              if (_link == Link.busy)
+                const SizedBox(
+                  width: 10,
+                  height: 10,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: C.warn,
+                  ),
+                )
+              else
+                Icon(
+                  _on ? Icons.bluetooth_connected : Icons.bluetooth,
+                  size: 14,
+                  color: fg,
+                ),
+              const SizedBox(width: 6),
               Text(
                 _statusText,
                 style: TextStyle(
                   fontSize: 12,
                   color: fg,
-                  fontWeight: _on ? FontWeight.w700 : FontWeight.w400,
+                  fontWeight: _on ? FontWeight.w700 : FontWeight.w500,
                 ),
               ),
             ],
@@ -722,305 +1178,315 @@ class _WatchLabPageState extends State<WatchLabPage>
     ),
   );
 
-  Widget _label(String t) => Text(
-    t.toUpperCase(),
-    style: const TextStyle(
-      color: C.muted,
-      fontSize: 11,
-      letterSpacing: 1.6,
-      fontWeight: FontWeight.w700,
+  Widget _label(String t, {IconData? icon}) => Padding(
+    padding: const EdgeInsets.only(bottom: 10),
+    child: Row(
+      children: [
+        if (icon != null) ...[
+          Icon(icon, size: 14, color: C.muted),
+          const SizedBox(width: 6),
+        ],
+        Text(
+          t.toUpperCase(),
+          style: const TextStyle(
+            color: C.muted,
+            fontSize: 11,
+            letterSpacing: 1.6,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
     ),
   );
 
-  Widget _mainCard() {
-    final pct = _goalVal > 0 ? math.min(1.0, _stepsVal / _goalVal) : 0.0;
-    final hasBatt = _batt != null && _batPct != null;
-    final batColor = !hasBatt
-        ? C.accent
-        : (_batPct! > 30 ? C.ok : (_batPct! > 15 ? C.warn : C.bad));
-    final ringPct = hasBatt ? _batPct! / 100 : pct;
-    final ringBig = hasBatt ? '$_batPct%' : '$_stepsVal';
-    final ringSub = hasBatt
-        ? 'BATTERY${_batMv != null ? '\n${(_batMv! / 1000).toStringAsFixed(2)} V' : ''}'
-        : 'STEPS';
-    final ring = SizedBox(
-      width: 160,
-      height: 160,
-      child: TweenAnimationBuilder<double>(
-        tween: Tween(end: ringPct),
-        duration: const Duration(milliseconds: 350),
-        curve: Curves.easeOut,
-        builder: (_, v, child) => CustomPaint(
-          painter: RingPainter(v, color: batColor),
-          child: child,
+  Widget _stat(String value, String label, {IconData? icon, Color? color}) =>
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: C.inset,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: C.line),
         ),
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                ringBig,
-                style: const TextStyle(
-                  fontSize: 34,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: -1.5,
-                  height: 1,
-                  color: C.text,
-                  fontFeatures: [FontFeature.tabularFigures()],
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                ringSub,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: C.muted,
-                  fontSize: 11,
-                  letterSpacing: 1.8,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-
-    Widget stat(String v, String l, {IconData? icon, double turns = 0}) =>
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: C.inset,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: C.line),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  if (icon != null) ...[
-                    AnimatedRotation(
-                      turns: turns,
-                      duration: const Duration(milliseconds: 300),
-                      child: Icon(icon, size: 18, color: C.accent),
-                    ),
-                    const SizedBox(width: 6),
-                  ],
-                  Flexible(
-                    child: Text(
-                      v,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                        color: C.text,
-                        fontFeatures: [FontFeature.tabularFigures()],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              Text(
-                l,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: C.muted, fontSize: 11),
-              ),
-            ],
-          ),
-        );
-
-    String two(int n) => n.toString().padLeft(2, '0');
-    const months = [
-      'Jan',
-      'Feb',
-      'Mar',
-      'Apr',
-      'May',
-      'Jun',
-      'Jul',
-      'Aug',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dec',
-    ];
-    final c = _clockNow;
-    final clockText = c != null
-        ? '${two(c.hour)}:${two(c.minute)}:${two(c.second)}'
-        : (_clock != null && _on ? 'not set' : _watchTime);
-    final clockSub = c != null
-        ? 'watch clock · ${c.day} ${months[c.month - 1]}'
-        : 'watch clock';
-
-    final stats = hasBatt || _rot != null
-        ? Column(
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: stat(
-                      clockText,
-                      clockSub,
-                      icon: Icons.schedule_rounded,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: stat(
-                      '${_rotVal * 90}°',
-                      'screen rotation',
-                      icon: Icons.screen_rotation_alt_rounded,
-                      turns: _rotVal / 4,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: stat(
-                      '$_stepsVal',
-                      'steps · ${(pct * 100).round()}% of goal',
-                      icon: Icons.directions_walk_rounded,
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: stat(
-                      '$_brightVal%',
-                      'brightness',
-                      icon: Icons.light_mode_rounded,
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          )
-        : Column(
-            children: [
-              Row(
-                children: [
-                  Expanded(child: stat('$_goalVal', 'daily goal')),
-                  const SizedBox(width: 10),
-                  Expanded(child: stat('${(pct * 100).round()}%', 'of goal')),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(child: stat('$_sensSent', 'sensitivity')),
-                  const SizedBox(width: 10),
-                  Expanded(child: stat(_watchTime, 'watch clock')),
-                ],
-              ),
-            ],
-          );
-
-    Widget legend(String key, String label, Color color) => InkWell(
-      borderRadius: BorderRadius.circular(8),
-      onTap: () => imu.toggle(key, !imu.visible[key]!),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SizedBox(
-              width: 22,
-              height: 22,
-              child: Checkbox(
-                value: imu.visible[key],
-                onChanged: (v) => imu.toggle(key, v ?? true),
-                activeColor: C.accent,
-                side: const BorderSide(color: C.muted),
-              ),
+            Row(
+              children: [
+                if (icon != null) ...[
+                  Icon(icon, size: 16, color: color ?? C.accent),
+                  const SizedBox(width: 6),
+                ],
+                Flexible(
+                  child: Text(
+                    value,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      color: color ?? C.text,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 6),
-            Container(
-              width: 10,
-              height: 10,
-              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            const SizedBox(height: 2),
+            Text(
+              label,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: C.muted, fontSize: 11),
             ),
-            const SizedBox(width: 6),
-            Text(label, style: const TextStyle(color: C.muted, fontSize: 12)),
           ],
         ),
-      ),
+      );
+
+  String _fmtTime(DateTime t, {bool seconds = true}) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    final s = seconds ? ':${two(t.second)}' : '';
+    if (_formatVal == 0) return '${two(t.hour)}:${two(t.minute)}$s';
+    final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
+    return '$h:${two(t.minute)}$s ${t.hour < 12 ? 'AM' : 'PM'}';
+  }
+
+  Widget _heroCard() {
+    final preview = LayoutBuilder(
+      builder: (_, b) {
+        final size = math.min(260.0, b.maxWidth);
+        return Center(
+          child: WatchPreview(face: _faceModel, size: size),
+        );
+      },
+    );
+    final c = _clockNow;
+    final stats = Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _stat(
+                c == null ? (_on ? 'not set' : '—') : _fmtTime(c),
+                'watch time',
+                icon: Icons.schedule_rounded,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _stat(
+                _batPct == null ? '—' : '$_batPct%',
+                'battery',
+                icon: Icons.battery_charging_full_rounded,
+                color: _batPct == null ? null : C.battery(_batPct),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: _stat(
+                '${_rotVal * 90}°',
+                'screen rotation',
+                icon: Icons.screen_rotation_alt_rounded,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _stat(
+                _faceVal == 1 ? 'Pendant' : 'Digital',
+                'watch face',
+                icon: _faceVal == 1
+                    ? Icons.diamond_outlined
+                    : Icons.watch_rounded,
+                color: _faceVal == 1 ? C.gold : null,
+              ),
+            ),
+          ],
+        ),
+        if (_imuSeen) ...[
+          const SizedBox(height: 10),
+          _stat(
+            '$_stepsVal',
+            'steps · goal $_goalVal',
+            icon: Icons.directions_walk_rounded,
+          ),
+        ],
+      ],
     );
 
     return _card(
       children: [
+        _label('Live watch', icon: Icons.visibility_outlined),
         LayoutBuilder(
           builder: (_, b) {
             if (b.maxWidth < 560) {
               return Column(
-                children: [ring, const SizedBox(height: 18), stats],
+                children: [preview, const SizedBox(height: 18), stats],
               );
             }
             return Row(
               children: [
-                SizedBox(width: 170, child: Center(child: ring)),
+                SizedBox(width: 270, child: preview),
                 const SizedBox(width: 18),
                 Expanded(child: stats),
               ],
             );
           },
         ),
-        const SizedBox(height: 16),
-        _label('IMU live'),
-        const SizedBox(height: 8),
-        if (_on && !_imuSeen)
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: C.inset,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: C.line),
-            ),
-            child: const Row(
-              children: [
-                Icon(Icons.sensors_off_rounded, color: C.muted),
-                SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'No motion data from this watch yet (the XIAO ESP32-S3 + Round Display '
-                    'has no motion sensor), so steps and this chart stay off. '
-                    'Time, battery, rotation and brightness work normally.',
-                    style: TextStyle(color: C.muted, fontSize: 13),
-                  ),
-                ),
-              ],
-            ),
-          )
-        else ...[
-          ClipRRect(
-            borderRadius: BorderRadius.circular(12),
-            child: Container(
-              height: 200,
-              color: C.plotBg,
-              child: CustomPaint(painter: ImuPainter(imu)),
+        if (!_on)
+          const Padding(
+            padding: EdgeInsets.only(top: 14),
+            child: Text(
+              'Connect to see the watch live. The preview mirrors its '
+              'face, time, battery and rotation.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: C.muted, fontSize: 13),
             ),
           ),
-          const SizedBox(height: 8),
-          ListenableBuilder(
-            listenable: imu,
-            builder: (_, _) => Wrap(
-              spacing: 12,
-              runSpacing: 4,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                legend('mag', 'mag', C.mag),
-                legend('x', 'X', C.ax),
-                legend('y', 'Y', C.ay),
-                legend('z', 'Z', C.az),
-                Text(
-                  'mag ${imu.shown['mag']!.round()} mg',
+      ],
+    );
+  }
+
+  Widget _batteryCard() {
+    final col = C.battery(_batPct);
+    final ago = _batAt == null
+        ? null
+        : DateTime.now().difference(_batAt!).inSeconds;
+    final health = _batPct == null
+        ? '—'
+        : (_batPct! > 30 ? 'Good' : (_batPct! > 15 ? 'Low' : 'Charge soon'));
+    return _card(
+      children: [
+        _label('Battery · live', icon: Icons.bolt_rounded),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(
+              _batPct == null ? '—' : '$_batPct%',
+              style: TextStyle(
+                fontSize: 40,
+                height: 1,
+                fontWeight: FontWeight.w800,
+                letterSpacing: -1.5,
+                color: _batPct == null ? C.muted : col,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    _batMv == null
+                        ? ''
+                        : '${(_batMv! / 1000).toStringAsFixed(3)} V',
+                    style: const TextStyle(
+                      color: C.text,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  Text(
+                    _batPct == null
+                        ? (_on ? 'waiting for watch…' : 'not connected')
+                        : '$health · updated ${ago! <= 1 ? 'now' : '${ago}s ago'}',
+                    style: const TextStyle(color: C.muted, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: LinearProgressIndicator(
+            value: (_batPct ?? 0) / 100,
+            minHeight: 8,
+            color: col,
+            backgroundColor: C.grid,
+          ),
+        ),
+        const SizedBox(height: 12),
+        Container(
+          height: 70,
+          decoration: BoxDecoration(
+            color: C.plotBg,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          padding: const EdgeInsets.all(8),
+          child: _batHist.length < 2
+              ? const Center(
+                  child: Text(
+                    'Voltage history appears here',
+                    style: TextStyle(color: C.muted, fontSize: 12),
+                  ),
+                )
+              : CustomPaint(painter: SparkPainter(List.of(_batHist), col)),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _batHist.length < 2
+              ? 'Updates every 2 seconds while connected.'
+              : 'Voltage, last ${(_batHist.length * 2 / 60).toStringAsFixed(1)} min',
+          style: const TextStyle(color: C.muted, fontSize: 11),
+        ),
+      ],
+    );
+  }
+
+  Widget _imuCard() {
+    Widget legend(String key, String label, Color color) => InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: () => imu.toggle(key, !imu.visible[key]!),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              imu.visible[key]!
+                  ? Icons.check_box_rounded
+                  : Icons.check_box_outline_blank_rounded,
+              size: 18,
+              color: color,
+            ),
+            const SizedBox(width: 4),
+            Text(label, style: const TextStyle(color: C.muted, fontSize: 12)),
+          ],
+        ),
+      ),
+    );
+    return _card(
+      children: [
+        _label('Motion · live', icon: Icons.sensors_rounded),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Container(
+            height: 180,
+            color: C.plotBg,
+            child: CustomPaint(painter: ImuPainter(imu)),
+          ),
+        ),
+        const SizedBox(height: 8),
+        ListenableBuilder(
+          listenable: imu,
+          builder: (_, _) => Wrap(
+            spacing: 10,
+            children: [
+              legend('mag', 'mag', C.mag),
+              legend('x', 'X', C.ax),
+              legend('y', 'Y', C.ay),
+              legend('z', 'Z', C.az),
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  '${imu.shown['mag']!.round()} mg',
                   style: const TextStyle(color: C.muted, fontSize: 12),
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
+        ),
       ],
     );
   }
@@ -1030,201 +1496,346 @@ class _WatchLabPageState extends State<WatchLabPage>
     VoidCallback? onPressed,
     bool primary = false,
     bool danger = false,
+    IconData? icon,
   }) {
     final bg = primary ? C.accent : (danger ? C.danger : C.btn);
     final fg = primary ? Colors.white : (danger ? C.dangerText : C.text);
+    final style = FilledButton.styleFrom(
+      backgroundColor: bg,
+      foregroundColor: fg,
+      disabledBackgroundColor: bg.withValues(alpha: 0.38),
+      disabledForegroundColor: fg.withValues(alpha: 0.38),
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 12),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+    );
     return Padding(
       padding: const EdgeInsets.only(top: 8),
-      child: FilledButton(
-        onPressed: onPressed,
-        style: FilledButton.styleFrom(
-          backgroundColor: bg,
-          foregroundColor: fg,
-          disabledBackgroundColor: bg.withValues(alpha: 0.38),
-          disabledForegroundColor: fg.withValues(alpha: 0.38),
-          padding: const EdgeInsets.symmetric(vertical: 14),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-          textStyle: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
-        ),
-        child: Text(label),
-      ),
+      child: icon == null
+          ? FilledButton(onPressed: onPressed, style: style, child: Text(label))
+          : FilledButton.icon(
+              onPressed: onPressed,
+              style: style,
+              icon: Icon(icon, size: 18),
+              label: Text(label),
+            ),
     );
   }
 
-  Widget _sideCards() {
+  Widget _connectionCard() {
     final busy = _link == Link.busy;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    return _card(
       children: [
-        _card(
+        _label('Connection', icon: Icons.link_rounded),
+        Row(
           children: [
-            _label('Connection'),
-            Row(
-              children: [
-                Expanded(
-                  child: _btn(
-                    'Connect',
-                    primary: true,
-                    onPressed: _on || busy ? null : _connect,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _btn(
-                    'Disconnect',
-                    onPressed: _on ? _disconnect : null,
-                  ),
-                ),
-              ],
-            ),
-            _btn(
-              'Sync phone date & time',
-              onPressed: _on ? () => _syncTime() : null,
-            ),
-            _btn(
-              'Reset steps on watch',
-              danger: true,
-              onPressed: _on ? _resetSteps : null,
-            ),
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                _note,
-                style: const TextStyle(color: C.muted, fontSize: 13),
+            Expanded(
+              child: _btn(
+                _savedId != null && !_on ? 'Reconnect' : 'Connect',
+                primary: true,
+                icon: Icons.bluetooth_searching_rounded,
+                onPressed: _on || busy ? null : () => _connect(),
               ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _btn('Disconnect', onPressed: _on ? _disconnect : null),
             ),
           ],
         ),
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Text(
+            _note,
+            style: const TextStyle(color: C.muted, fontSize: 13),
+          ),
+        ),
+        if (_savedId != null)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: busy ? null : _forget,
+              icon: const Icon(Icons.link_off_rounded, size: 16),
+              label: const Text('Forget this watch'),
+              style: TextButton.styleFrom(foregroundColor: C.muted),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _clockCard() {
+    final d = _driftSec;
+    final drift = d == null
+        ? (_on ? 'Watch time not set yet' : '')
+        : (d.abs() <= 2
+              ? 'In sync with this phone'
+              : 'Watch is ${d.abs()} s ${d > 0 ? 'ahead' : 'behind'}');
+    return _card(
+      children: [
+        _label('Clock', icon: Icons.schedule_rounded),
+        SegmentedButton<int>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment(value: 0, label: Text('24-hour')),
+            ButtonSegment(value: 1, label: Text('12-hour AM/PM')),
+          ],
+          selected: {_formatVal},
+          onSelectionChanged: _on && _format != null
+              ? (s) => _sendByte(
+                  _format,
+                  s.first,
+                  'Time format: ${s.first == 1 ? '12-hour' : '24-hour'}',
+                  () => _formatVal = s.first,
+                )
+              : null,
+        ),
+        _btn(
+          'Sync time from phone',
+          icon: Icons.sync_rounded,
+          onPressed: _on ? () => _syncTime() : null,
+        ),
+        if (drift.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Row(
+              children: [
+                Icon(
+                  d != null && d.abs() <= 2
+                      ? Icons.check_circle_rounded
+                      : Icons.info_outline_rounded,
+                  size: 14,
+                  color: d != null && d.abs() <= 2 ? C.ok : C.warn,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  drift,
+                  style: const TextStyle(color: C.muted, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _displayCard() {
+    const sleeps = [0, 10, 30, 60, 120];
+    String sleepLabel(int s) =>
+        s == 0 ? 'Always on' : (s < 60 ? '${s}s' : '${s ~/ 60} min');
+    return _card(
+      children: [
+        _label('Display', icon: Icons.tune_rounded),
+        const Text(
+          'Watch face',
+          style: TextStyle(color: C.muted, fontSize: 13),
+        ),
+        const SizedBox(height: 6),
+        SegmentedButton<int>(
+          showSelectedIcon: false,
+          segments: const [
+            ButtonSegment(
+              value: 0,
+              icon: Icon(Icons.watch_rounded),
+              label: Text('Digital'),
+            ),
+            ButtonSegment(
+              value: 1,
+              icon: Icon(Icons.diamond_outlined),
+              label: Text('Pendant'),
+            ),
+          ],
+          selected: {_faceVal},
+          onSelectionChanged: _on && _face != null
+              ? (s) => _sendByte(
+                  _face,
+                  s.first,
+                  s.first == 1 ? 'Pendant face on' : 'Digital face on',
+                  () => _faceVal = s.first,
+                )
+              : null,
+        ),
         const SizedBox(height: 14),
-        _card(
+        Row(
           children: [
-            _label('Watch screen'),
-            const SizedBox(height: 4),
             const Text(
               'Rotation',
               style: TextStyle(color: C.muted, fontSize: 13),
             ),
-            Row(
-              children: [
-                for (var r = 0; r < 4; r++) ...[
-                  if (r > 0) const SizedBox(width: 8),
-                  Expanded(
-                    child: _btn(
-                      '${r * 90}°',
-                      primary: _on && _rot != null && _rotVal == r,
-                      onPressed: _on && _rot != null && _rotVal != r
-                          ? () => _sendRotation(r)
-                          : null,
-                    ),
-                  ),
-                ],
-              ],
+            const SizedBox(width: 12),
+            Flexible(
+              child: Text(
+                'or long-press the watch',
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  color: C.muted.withValues(alpha: 0.7),
+                  fontSize: 11,
+                ),
+              ),
             ),
-            const SizedBox(height: 12),
+          ],
+        ),
+        Row(
+          children: [
+            for (var r = 0; r < 4; r++) ...[
+              if (r > 0) const SizedBox(width: 8),
+              Expanded(
+                child: _btn(
+                  '${r * 90}°',
+                  primary: _hasScreen && _rotVal == r,
+                  onPressed: _hasScreen && _rotVal != r
+                      ? () => _sendByte(_rot, r, '', () => _rotVal = r)
+                      : null,
+                ),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 14),
+        Row(
+          children: [
+            const Icon(Icons.light_mode_rounded, size: 16, color: C.muted),
+            const SizedBox(width: 6),
             Text(
               'Brightness $_brightVal%',
               style: const TextStyle(color: C.muted, fontSize: 13),
             ),
-            Slider(
-              value: _brightVal.toDouble(),
-              min: 5,
-              max: 100,
-              divisions: 19,
-              label: '$_brightVal%',
-              onChanged: _on && _bright != null
-                  ? (v) => setState(() => _brightVal = v.round())
-                  : null,
-              onChangeEnd: _on && _bright != null
-                  ? (v) => _sendBrightness(v.round())
-                  : null,
-            ),
-            if (_on && _rot == null && _bright == null)
-              const Text(
-                'This watch firmware has no screen controls.',
-                style: TextStyle(color: C.muted, fontSize: 12),
+          ],
+        ),
+        Slider(
+          value: _brightVal.toDouble(),
+          min: 5,
+          max: 100,
+          divisions: 19,
+          label: '$_brightVal%',
+          onChanged: _on && _bright != null
+              ? (v) => _set(() => _brightVal = v.round())
+              : null,
+          onChangeEnd: _on && _bright != null
+              ? (v) => _sendByte(_bright, v.round(), '', () {})
+              : null,
+        ),
+        const Text(
+          'Screen sleep (pendant battery saver)',
+          style: TextStyle(color: C.muted, fontSize: 13),
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final s in sleeps)
+              ChoiceChip(
+                label: Text(sleepLabel(s)),
+                selected: _sleepVal == s,
+                showCheckmark: false,
+                selectedColor: C.accent,
+                backgroundColor: C.btn,
+                side: const BorderSide(color: C.line),
+                labelStyle: TextStyle(
+                  color: _sleepVal == s ? Colors.white : C.text,
+                  fontWeight: FontWeight.w600,
+                ),
+                onSelected: _on && _sleep != null
+                    ? (_) => _sendByte(
+                        _sleep,
+                        s,
+                        s == 0
+                            ? 'Screen stays on'
+                            : 'Screen sleeps after ${sleepLabel(s)} · tap to wake',
+                        () => _sleepVal = s,
+                      )
+                    : null,
               ),
           ],
         ),
-        const SizedBox(height: 14),
-        _card(
-          children: [
-            _label('Daily goal'),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _goalCtl,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              style: const TextStyle(fontSize: 16, color: C.text),
-              decoration: InputDecoration(
-                filled: true,
-                fillColor: C.plotBg,
-                isDense: true,
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 12,
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: C.line),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: C.accent),
-                ),
-              ),
+        if (_on && _rot == null)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'This watch firmware has no display controls.',
+              style: TextStyle(color: C.muted, fontSize: 12),
             ),
-            const SizedBox(height: 2),
-            Row(
-              children: [
-                for (final (i, g) in const [
-                  5000,
-                  8000,
-                  10000,
-                  12000,
-                ].indexed) ...[
-                  if (i > 0) const SizedBox(width: 8),
-                  Expanded(
-                    child: _btn(
-                      '${g ~/ 1000}k',
-                      onPressed: () => setState(() => _goalCtl.text = '$g'),
-                    ),
+          ),
+      ],
+    );
+  }
+
+  static String _sensWord(int v) =>
+      v <= 3 ? 'strict' : (v >= 8 ? 'sensitive' : 'balanced');
+
+  Widget _stepsCard() {
+    return _card(
+      children: [
+        _label('Steps', icon: Icons.directions_walk_rounded),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _goalCtl,
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                style: const TextStyle(fontSize: 16, color: C.text),
+                decoration: InputDecoration(
+                  labelText: 'Daily goal',
+                  filled: true,
+                  fillColor: C.plotBg,
+                  isDense: true,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
                   ),
-                ],
-              ],
-            ),
-            const SizedBox(height: 2),
-            _btn('Send goal', primary: true, onPressed: _on ? _sendGoal : null),
-          ],
-        ),
-        const SizedBox(height: 14),
-        _card(
-          children: [
-            _label('Step sensitivity'),
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                '$_sensVal — ${_sensWord(_sensVal)}',
-                style: const TextStyle(color: C.muted, fontSize: 13),
+                ),
               ),
             ),
-            Slider(
-              value: _sensVal.toDouble(),
-              min: 1,
-              max: 10,
-              divisions: 9,
-              label: '$_sensVal',
-              onChanged: _on
-                  ? (v) => setState(() => _sensVal = v.round())
-                  : null,
-              onChangeEnd: _on ? (v) => _sendSens(v.round()) : null,
-            ),
-            const Text(
-              '1 strict (fewer false steps) · 10 sensitive (lighter motion)',
-              style: TextStyle(color: C.muted, fontSize: 13),
+            const SizedBox(width: 8),
+            SizedBox(
+              width: 90,
+              child: _btn(
+                'Send',
+                primary: true,
+                onPressed: _on ? _sendGoal : null,
+              ),
             ),
           ],
+        ),
+        Row(
+          children: [
+            for (final (i, g) in const [5000, 8000, 10000, 12000].indexed) ...[
+              if (i > 0) const SizedBox(width: 8),
+              Expanded(
+                child: _btn(
+                  '${g ~/ 1000}k',
+                  onPressed: () => _set(() => _goalCtl.text = '$g'),
+                ),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Sensitivity $_sensVal — ${_sensWord(_sensVal)}',
+          style: const TextStyle(color: C.muted, fontSize: 13),
+        ),
+        Slider(
+          value: _sensVal.toDouble(),
+          min: 1,
+          max: 10,
+          divisions: 9,
+          label: '$_sensVal',
+          onChanged: _on ? (v) => _set(() => _sensVal = v.round()) : null,
+          onChangeEnd: _on
+              ? (v) => _sendByte(
+                  _sens,
+                  v.round(),
+                  'Sensitivity ${v.round()} sent',
+                  () {},
+                )
+              : null,
+        ),
+        _btn(
+          'Reset steps on watch',
+          danger: true,
+          onPressed: _on ? _resetSteps : null,
         ),
       ],
     );
@@ -1232,8 +1843,7 @@ class _WatchLabPageState extends State<WatchLabPage>
 }
 
 // ---------------------------------------------------------------------------
-// Scan sheet: lists StepCounter watches found nearby (replaces the browser's
-// device picker, which iOS apps don't have).
+// Scan sheet: nearby StepCounter watches (iOS has no browser device picker).
 // ---------------------------------------------------------------------------
 class _ScanSheet extends StatelessWidget {
   const _ScanSheet();
