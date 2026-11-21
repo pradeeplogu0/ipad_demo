@@ -3,16 +3,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:ipad_demo/main.dart';
 
 void main() {
-  testWidgets('tapping the box increments and reset clears', (tester) async {
-    await tester.pumpWidget(const IpadDemoApp());
-    expect(find.text('0'), findsOneWidget);
+  testWidgets('Watch Lab renders disconnected', (tester) async {
+    await tester.pumpWidget(const WatchLabApp());
+    await tester.pump(const Duration(milliseconds: 100));
 
-    await tester.tap(find.text('0'));
-    await tester.pumpAndSettle();
-    expect(find.text('1'), findsOneWidget);
-
-    await tester.tap(find.byTooltip('Reset'));
-    await tester.pumpAndSettle();
-    expect(find.text('0'), findsOneWidget);
+    expect(find.text('Watch Lab'), findsOneWidget);
+    expect(find.text('Disconnected'), findsOneWidget);
+    expect(find.text('Connect'), findsOneWidget);
+    expect(find.text('8000'), findsWidgets);
   });
 }
