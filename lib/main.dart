@@ -10,6 +10,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'face_designer.dart';
 import 'face_layout.dart';
 import 'face_painter.dart';
+import 'nav_engine.dart';
+import 'nav_page.dart';
 
 // ---------------------------------------------------------------------------
 // Watch protocol — service 4b0ad7a0-…; see firmware/RoundWatchESP32/ble_service.cpp
@@ -32,6 +34,7 @@ final Guid kSleep = _u('ad');
 final Guid kLayout = _u(
   'ae',
 ); // R W N face designer // R W N seconds, 0 = always on
+final Guid kNav = _u('af'); // W turn-by-turn navigation
 const String kNamePrefix = 'StepCounter';
 const String kPrefLastWatch = 'last_watch_id';
 
@@ -267,7 +270,8 @@ class _WatchLabPageState extends State<WatchLabPage>
       _format,
       _face,
       _sleep,
-      _layoutChr;
+      _layoutChr,
+      _navChr;
   final _subs = <StreamSubscription>[];
   bool _userDisconnect = false;
   String? _savedId;
@@ -292,6 +296,10 @@ class _WatchLabPageState extends State<WatchLabPage>
   final _layout = FaceLayout();
   (int, int)? _dragSkip; // element being dragged in the designer
   Future<void> _writeQueue = Future.value();
+  late final NavController _nav = NavController(
+    send: () =>
+        (_on && _navChr != null) ? (pkt) => _write(_navChr!, pkt) : null,
+  );
 
   bool get _on => _link == Link.on;
   bool get _hasScreen => _on && _rot != null;
@@ -310,6 +318,7 @@ class _WatchLabPageState extends State<WatchLabPage>
     _cancelSubs();
     _goalCtl.dispose();
     imu.dispose();
+    _nav.dispose();
     super.dispose();
   }
 
@@ -551,6 +560,7 @@ class _WatchLabPageState extends State<WatchLabPage>
     _face = opt(kFace);
     _sleep = opt(kSleep);
     _layoutChr = opt(kLayout);
+    _navChr = opt(kNav);
     _imuSeen = false;
     _batHist.clear();
 
@@ -647,7 +657,7 @@ class _WatchLabPageState extends State<WatchLabPage>
     _cancelSubs();
     _steps = _reset = _goal = _time = _sens = _imu = null;
     _batt = _clock = _rot = _bright = _format = _face = _sleep = _layoutChr =
-        null;
+        _navChr = null;
     _setStatus(Link.off, 'Disconnected', note);
   }
 
@@ -737,6 +747,97 @@ class _WatchLabPageState extends State<WatchLabPage>
 
   WatchFace get _faceModel => _faceFor(_faceVal);
 
+  Future<void> _openNav() async {
+    HapticFeedback.selectionClick();
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => NavPage(
+          nav: _nav,
+          watchConnected: () => _on && _navChr != null,
+          h12: _formatVal == 1,
+        ),
+      ),
+    );
+    _set(() {});
+  }
+
+  Widget _navCard() {
+    return ListenableBuilder(
+      listenable: _nav,
+      builder: (context, _) {
+        final st = _nav.state;
+        return _card(
+          children: [
+            _label('Navigation', icon: Icons.navigation_rounded),
+            if (st != null)
+              InkWell(
+                onTap: _openNav,
+                borderRadius: BorderRadius.circular(12),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 56,
+                      height: 56,
+                      child: CustomPaint(
+                        painter: ManeuverPainter(
+                          st.maneuver,
+                          color: st.toTurn <= 100 ? C.gold : Colors.white,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            fmtDistance(st.toTurn),
+                            style: const TextStyle(
+                              color: C.text,
+                              fontSize: 22,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          Text(
+                            st.text,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: C.muted,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            else
+              const Text(
+                'Turn-by-turn directions on your watch, powered by Apple Maps.',
+                style: TextStyle(color: C.muted, fontSize: 13),
+              ),
+            _btn(
+              st != null ? 'Open navigation' : 'Navigate',
+              primary: true,
+              icon: Icons.navigation_rounded,
+              onPressed: _openNav,
+            ),
+            if (_on && _navChr == null)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Update the watch firmware to show directions on it.',
+                  style: TextStyle(color: C.muted, fontSize: 12),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
   // ---------------- face designer ----------------
   bool get _canDesign => _on && _layoutChr != null;
 
@@ -799,6 +900,8 @@ class _WatchLabPageState extends State<WatchLabPage>
               ];
               final right = <Widget>[
                 _connectionCard(),
+                const SizedBox(height: 14),
+                _navCard(),
                 const SizedBox(height: 14),
                 _clockCard(),
                 const SizedBox(height: 14),

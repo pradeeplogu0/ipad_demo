@@ -24,8 +24,9 @@ void main() {
     expect(b.faces[0][elTime].size, 3); // digital defaults untouched
   });
 
-  testWidgets('designer: phone width, select + drag sends an edit',
-      (tester) async {
+  testWidgets('designer: phone width, select + drag sends an edit', (
+    tester,
+  ) async {
     tester.view.physicalSize = const Size(375, 1800);
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.reset);
@@ -33,28 +34,30 @@ void main() {
     final layout = FaceLayout();
     final sent = <List<int>>[];
     WatchFace faceFor(int f) => WatchFace(
-          face: f,
-          elements: layout.faces[f],
-          h12: true,
-          time: DateTime(2026, 11, 21, 14, 5, 42),
-          batPct: 92,
-          batMv: 4130,
-          rotation: 0,
-          connected: true,
-          steps: 0,
-        );
+      face: f,
+      elements: layout.faces[f],
+      h12: true,
+      time: DateTime(2026, 11, 21, 14, 5, 42),
+      batPct: 92,
+      batMv: 4130,
+      rotation: 0,
+      connected: true,
+      steps: 0,
+    );
 
-    await tester.pumpWidget(MaterialApp(
-      home: FaceDesignerPage(
-        layout: layout,
-        initialFace: faceDigital,
-        faceFor: faceFor,
-        onEdit: (e) async => sent.add(e.encode()),
-        onReset: () async {},
-        onShowFace: (_) async {},
-        onDragging: (_) {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: FaceDesignerPage(
+          layout: layout,
+          initialFace: faceDigital,
+          faceFor: faceFor,
+          onEdit: (e) async => sent.add(e.encode()),
+          onReset: () async {},
+          onShowFace: (_) async {},
+          onDragging: (_) {},
+        ),
       ),
-    ));
+    );
     await tester.pump();
     expect(tester.takeException(), isNull);
 

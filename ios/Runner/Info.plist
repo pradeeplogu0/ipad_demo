@@ -6,6 +6,15 @@
 	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Watch Lab uses your location for turn-by-turn directions on your watch.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Watch Lab keeps giving directions on your watch while the phone is locked.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>bluetooth-central</string>
+	</array>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Watch Lab uses Bluetooth to connect to your StepCounter watch.</string>
 	<key>CFBundleDisplayName</key>
