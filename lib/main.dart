@@ -12,6 +12,8 @@ import 'face_layout.dart';
 import 'face_painter.dart';
 import 'nav_engine.dart';
 import 'nav_page.dart';
+import 'voice.dart';
+import 'voice_page.dart';
 
 // ---------------------------------------------------------------------------
 // Watch protocol — service 4b0ad7a0-…; see firmware/RoundWatchESP32/ble_service.cpp
@@ -31,6 +33,9 @@ final Guid kBright = _u('aa'); // R W N 5-100
 final Guid kFormat = _u('ab'); // R W N 0 = 24 h, 1 = 12 h
 final Guid kFace = _u('ac'); // R W N 0 = digital, 1 = pendant
 final Guid kSleep = _u('ad');
+final Guid kAuto = _u('b0'); // R W N 0 = manual, 1 = auto-rotate from accel
+final Guid kVoiceCtrl = _u('b1'); // R W N  1=start 0=stop 2=download 3=cancel
+final Guid kVoiceData = _u('b2'); // R N    header / ADPCM packets / end
 final Guid kLayout = _u(
   'ae',
 ); // R W N face designer // R W N seconds, 0 = always on
@@ -270,8 +275,11 @@ class _WatchLabPageState extends State<WatchLabPage>
       _format,
       _face,
       _sleep,
+      _auto,
       _layoutChr,
-      _navChr;
+      _navChr,
+      _voiceCtrl,
+      _voiceData;
   final _subs = <StreamSubscription>[];
   bool _userDisconnect = false;
   String? _savedId;
@@ -291,7 +299,8 @@ class _WatchLabPageState extends State<WatchLabPage>
       _brightVal = 100,
       _formatVal = 0,
       _faceVal = 0,
-      _sleepVal = 0;
+      _sleepVal = 0,
+      _autoVal = 0;
   bool _imuSeen = false;
   final _layout = FaceLayout();
   (int, int)? _dragSkip; // element being dragged in the designer
@@ -299,6 +308,10 @@ class _WatchLabPageState extends State<WatchLabPage>
   late final NavController _nav = NavController(
     send: () =>
         (_on && _navChr != null) ? (pkt) => _write(_navChr!, pkt) : null,
+  );
+  late final VoiceController _voice = VoiceController(
+    resolveWriter: () =>
+        (_on && _voiceCtrl != null) ? (c) => _write(_voiceCtrl!, [c]) : null,
   );
 
   bool get _on => _link == Link.on;
@@ -310,6 +323,7 @@ class _WatchLabPageState extends State<WatchLabPage>
     super.initState();
     _ticker.start();
     _loadSaved();
+    _voice.loadNotes();
   }
 
   @override
@@ -319,6 +333,7 @@ class _WatchLabPageState extends State<WatchLabPage>
     _goalCtl.dispose();
     imu.dispose();
     _nav.dispose();
+    _voice.dispose();
     super.dispose();
   }
 
@@ -559,8 +574,11 @@ class _WatchLabPageState extends State<WatchLabPage>
     _format = opt(kFormat);
     _face = opt(kFace);
     _sleep = opt(kSleep);
+    _auto = opt(kAuto);
     _layoutChr = opt(kLayout);
     _navChr = opt(kNav);
+    _voiceCtrl = opt(kVoiceCtrl);
+    _voiceData = opt(kVoiceData);
     _imuSeen = false;
     _batHist.clear();
 
@@ -587,10 +605,13 @@ class _WatchLabPageState extends State<WatchLabPage>
     await listen(_format, (v) => _set(() => _formatVal = b0(v, 0, 1, 0)));
     await listen(_face, (v) => _set(() => _faceVal = b0(v, 0, 1, 0)));
     await listen(_sleep, (v) => _set(() => _sleepVal = b0(v, 0, 255, 0)));
+    await listen(_auto, (v) => _set(() => _autoVal = b0(v, 0, 1, 0)));
     await listen(
       _layoutChr,
       (v) => _set(() => _layout.apply(v, skip: _dragSkip)),
     );
+    await listen(_voiceCtrl, _voice.onStatus);
+    await listen(_voiceData, _voice.onData, read: false);
 
     final goal = await _goal!.read();
     final sens = await _sens!.read();
@@ -656,8 +677,8 @@ class _WatchLabPageState extends State<WatchLabPage>
   void _onOff(String note) {
     _cancelSubs();
     _steps = _reset = _goal = _time = _sens = _imu = null;
-    _batt = _clock = _rot = _bright = _format = _face = _sleep = _layoutChr =
-        _navChr = null;
+    _batt = _clock = _rot = _bright = _format = _face = _sleep = _auto =
+        _layoutChr = _navChr = _voiceCtrl = _voiceData = null;
     _setStatus(Link.off, 'Disconnected', note);
   }
 
@@ -838,6 +859,58 @@ class _WatchLabPageState extends State<WatchLabPage>
     );
   }
 
+  // ---------------- voice notes ----------------
+  Future<void> _openVoice() async {
+    HapticFeedback.selectionClick();
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            VoicePage(voice: _voice, canUse: () => _on && _voiceCtrl != null),
+      ),
+    );
+    _set(() {});
+  }
+
+  Widget _voiceCard() {
+    return ListenableBuilder(
+      listenable: _voice,
+      builder: (context, _) {
+        final rec = _voice.phase == VoicePhase.recording;
+        final recv = _voice.phase == VoicePhase.receiving;
+        final n = _voice.notes.length;
+        return _card(
+          children: [
+            _label('Voice notes', icon: Icons.mic_rounded),
+            Text(
+              rec
+                  ? 'Recording… ${_voice.seconds}s'
+                  : recv
+                  ? 'Downloading ${(_voice.progress * 100).round()}%'
+                  : n == 0
+                  ? 'Record from the watch mic and store notes here.'
+                  : '$n saved note${n == 1 ? '' : 's'}.',
+              style: const TextStyle(color: C.muted, fontSize: 13),
+            ),
+            _btn(
+              'Open voice notes',
+              primary: true,
+              icon: Icons.graphic_eq_rounded,
+              onPressed: _openVoice,
+            ),
+            if (_on && _voiceCtrl == null)
+              const Padding(
+                padding: EdgeInsets.only(top: 8),
+                child: Text(
+                  'Update the watch firmware to record voice notes.',
+                  style: TextStyle(color: C.muted, fontSize: 12),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
   // ---------------- face designer ----------------
   bool get _canDesign => _on && _layoutChr != null;
 
@@ -902,6 +975,8 @@ class _WatchLabPageState extends State<WatchLabPage>
                 _connectionCard(),
                 const SizedBox(height: 14),
                 _navCard(),
+                const SizedBox(height: 14),
+                _voiceCard(),
                 const SizedBox(height: 14),
                 _clockCard(),
                 const SizedBox(height: 14),
@@ -1556,13 +1631,39 @@ class _WatchLabPageState extends State<WatchLabPage>
         ),
         Row(
           children: [
+            const Icon(
+              Icons.screen_rotation_alt_rounded,
+              size: 16,
+              color: C.muted,
+            ),
+            const SizedBox(width: 6),
+            const Text(
+              'Auto-rotate',
+              style: TextStyle(color: C.muted, fontSize: 13),
+            ),
+            const Spacer(),
+            Switch.adaptive(
+              value: _autoVal == 1,
+              onChanged: _on && _auto != null
+                  ? (on) => _sendByte(
+                      _auto,
+                      on ? 1 : 0,
+                      on ? 'Auto-rotate on' : 'Auto-rotate off',
+                      () => _autoVal = on ? 1 : 0,
+                    )
+                  : null,
+            ),
+          ],
+        ),
+        Row(
+          children: [
             for (var r = 0; r < 4; r++) ...[
               if (r > 0) const SizedBox(width: 8),
               Expanded(
                 child: _btn(
                   '${r * 90}°',
-                  primary: _hasScreen && _rotVal == r,
-                  onPressed: _hasScreen && _rotVal != r
+                  primary: _hasScreen && _autoVal == 0 && _rotVal == r,
+                  onPressed: _hasScreen && _autoVal == 0 && _rotVal != r
                       ? () => _sendByte(_rot, r, '', () => _rotVal = r)
                       : null,
                 ),
